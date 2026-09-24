@@ -1,0 +1,6 @@
+mlx-whisper
+customtkinter
+tkinterdnd2
+python-docx
+pyannote.audio
+numpy

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Временные файлы обработки
+*_norm.wav
+_ml_*.wav
+_old_*.wav
+*_diar.wav
+.audio2text.json
+
+# Рабочее — не для репозитория
+_Архив*/
+_На удаление/
+*.docx
+HANDOFF.md
+ml_fast_prototype.py
+*.app
+*.textClipping
+
+# Сборка .app
+build/
+dist/
+*.spec
