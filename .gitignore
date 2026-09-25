@@ -26,3 +26,6 @@ ml_fast_prototype.py
 build/
 dist/
 *.spec
+
+# лог диктофонного воркера
+_worker.log

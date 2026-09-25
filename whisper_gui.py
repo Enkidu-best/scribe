@@ -24,6 +24,28 @@ import threading
 import subprocess
 import contextlib
 from pathlib import Path
+import sys
+import platform
+
+# На Apple Silicon MLX работает только в arm64. Если приложение запустили в
+# x86_64 (Rosetta или .app с чужой архитектурой) — перезапускаем себя нативно,
+# иначе mlx.core не загрузится (ошибка "incompatible architecture").
+if (sys.platform == "darwin" and platform.machine() == "x86_64"
+        and not os.environ.get("SCRIBE_ARM64")):
+    os.environ["SCRIBE_ARM64"] = "1"
+    try:
+        os.execvp("arch", ["arch", "-arm64", sys.executable] + sys.argv)
+    except Exception:
+        pass
+
+# В собранном .app (py2app) главный исполняемый файл — сам Scribe, а не python.
+# Поэтому процесс распознавания диктофона запускается перезапуском приложения
+# с этим флагом. Ловим его до поднятия интерфейса и уходим в воркер.
+if len(sys.argv) >= 2 and sys.argv[1] == "--dictaphone-worker":
+    import dictaphone_worker
+    sys.argv = [sys.argv[0]] + sys.argv[2:]
+    dictaphone_worker.main()
+    sys.exit(0)
 
 # --- PATH: чтобы ffmpeg/ffprobe нашлись даже при запуске из Finder ---
 for _p in ("/opt/homebrew/bin", "/usr/local/bin", os.path.expanduser("~/.local/bin")):
@@ -96,10 +118,20 @@ def _apply_models_dir(d):
     if d:
         os.environ["HF_HOME"] = d
 
-AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".opus",
-              ".mp4", ".mov", ".m4v", ".mkv", ".webm", ".aiff"}
+AUDIO_EXTS = {
+    # аудио
+    ".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".oga", ".opus",
+    ".aiff", ".aif", ".wma", ".m4b", ".amr", ".mka", ".ape", ".wv", ".caf", ".ac3",
+    # видео
+    ".mp4", ".mov", ".m4v", ".mkv", ".webm", ".wmv", ".avi", ".flv",
+    ".3gp", ".3g2", ".ts", ".mts", ".m2ts", ".mpg", ".mpeg", ".asf", ".vob", ".ogv",
+}
 AUDIO_TYPES = [("Аудио и видео", " ".join("*" + e for e in sorted(AUDIO_EXTS))),
                ("Все файлы", "*.*")]
+
+# Список поддерживаемых форматов — показываем в «Настройках».
+FORMATS_AUDIO = "MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, AIFF, WMA, M4B, AMR"
+FORMATS_VIDEO = "MP4, MOV, MKV, WEBM, WMV, AVI, FLV, 3GP, TS, MPG"
 
 APP_VERSION = "2.0"   # внутренняя версия, в интерфейсе не показывается
 CONFIG_PATH = Path(os.path.expanduser("~/.audio2text.json"))
@@ -697,7 +729,7 @@ class SettingsWindow(ctk.CTkToplevel):
         super().__init__(master)
         self.app = app
         self.title("Настройки")
-        self.geometry("560x540")
+        self.geometry("560x620")
         self.transient(master)
         P = {"padx": 20}
 
@@ -737,6 +769,13 @@ class SettingsWindow(ctk.CTkToplevel):
         self.check_btn.pack(side="left")
         self.status = ctk.CTkLabel(self, text="", justify="left", wraplength=500)
         self.status.pack(anchor="w", pady=(8, 0), **P)
+
+        # --- Поддерживаемые форматы ---
+        ctk.CTkLabel(self, text="Поддерживаемые форматы",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", pady=(16, 2), **P)
+        ctk.CTkLabel(self, text=f"Аудио: {FORMATS_AUDIO}\nВидео: {FORMATS_VIDEO}\n"
+                                "и вообще всё, что умеет открывать ffmpeg.",
+                     text_color="gray", justify="left", wraplength=500).pack(anchor="w", pady=(2, 0), **P)
 
         ctk.CTkLabel(self, text=f"Scribe {APP_VERSION}  ·  локально на Apple MLX",
                      text_color="gray").pack(side="bottom", pady=(0, 12))
@@ -813,6 +852,7 @@ class App:
         self.running = False
         self.start_time = None
         self.settings_win = None
+        self.dict_win = None
         self.last_dir = None
 
         ctk.set_appearance_mode("system")
@@ -842,6 +882,8 @@ class App:
                      font=ctk.CTkFont(size=24, weight="bold")).pack(side="left")
         ctk.CTkButton(head, text="⚙︎ Настройки", width=110,
                       command=self._open_settings).pack(side="right")
+        ctk.CTkButton(head, text="🎤 Диктофон", width=120,
+                      command=self._open_dictaphone).pack(side="right", padx=(0, 8))
 
         body = ctk.CTkFrame(self.root, fg_color="transparent")
         body.pack(fill="x", padx=18, pady=(2, 0))
@@ -904,10 +946,10 @@ class App:
         self.nspk_menu.pack(side="left")
         self.norm_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(o, text="Нормализовать громкость (меньше ошибок, чуть дольше)",
-                      variable=self.norm_var).pack(anchor="w", pady=(6, 2))
+                      variable=self.norm_var).pack(anchor="w", pady=(12, 8))
         self.ts_var = ctk.BooleanVar(value=False)
         ctk.CTkSwitch(o, text="Добавлять таймкоды (для .txt и Word)",
-                      variable=self.ts_var).pack(anchor="w", pady=(2, 2))
+                      variable=self.ts_var).pack(anchor="w", pady=(0, 4))
         self._toggle_diar(); self.refresh_token_badge()
 
         # --- Запуск / прогресс / низ ---
@@ -930,6 +972,17 @@ class App:
         if self.settings_win is None or not self.settings_win.winfo_exists():
             self.settings_win = SettingsWindow(self.root, self)
         self.settings_win.focus()
+
+    def _open_dictaphone(self):
+        if self.dict_win is not None and self.dict_win.winfo_exists():
+            self.dict_win.focus(); return
+        try:
+            from dictaphone import DictaphoneWindow
+        except Exception as e:
+            messagebox.showerror("Диктофон", f"Не удалось загрузить модуль диктофона:\n{e}")
+            return
+        self.dict_win = DictaphoneWindow(self.root, self.cfg.get("model_repo", MODEL_REPO))
+        self.dict_win.focus()
 
     def refresh_token_badge(self):
         if self.cfg.get("hf_token"):

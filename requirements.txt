@@ -4,3 +4,4 @@ tkinterdnd2
 python-docx
 pyannote.audio
 numpy
+sounddevice
