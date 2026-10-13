@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Диктофон для Scribe — живая диктовка с микрофона в реальном времени.
-Открывается кнопкой «🎤 Диктофон» из главного окна.
+Страница «Диктофон» главного окна.
 
 Как работает:
   захват микрофона (sounddevice) → нарезка речи на фразы по паузам
@@ -31,6 +31,8 @@ import numpy as np
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from pathlib import Path
+
+import theme as T
 
 SR = 16000
 FRAME = 0.03                 # длина кадра, сек
@@ -189,13 +191,28 @@ class MicRecorder:
             self.phrase_q.put(tail)
 
 
-class DictaphoneWindow(ctk.CTkToplevel):
+LOG_DIR = Path.home() / "Library" / "Logs" / "Scribe"
+
+# Состояние → (текст, вид чипа)
+_ST = {
+    "loading": ("Модель загружается…", "neutral"),
+    "ready": ("Готов к диктовке", "ok"),
+    "listen": ("Слушаю…", "acc"),
+    "listen_wait": ("Слушаю… модель ещё загружается", "acc"),
+    "busy": ("Распознаю…", "warn"),
+    "paused": ("Пауза", "warn"),
+    "stopped": ("Остановлено", "neutral"),
+}
+
+
+class DictaphonePage(ctk.CTkFrame):
+    """Страница «Диктофон» главного окна. Процесс распознавания поднимается при
+    первом открытии страницы (activate) и живёт до закрытия приложения
+    (shutdown) — повторные заходы на страницу мгновенные."""
+
     def __init__(self, master, model_repo=DEFAULT_MODEL):
-        super().__init__(master)
+        super().__init__(master, fg_color="transparent", corner_radius=0)
         self.model_repo = model_repo
-        self.title("Scribe — диктофон")
-        self.geometry("640x580")
-        self.minsize(540, 460)
 
         self.phrase_q = queue.Queue()      # фразы от захвата → воркеру
         self.ui_q = queue.Queue()          # события → главный поток (Tk)
@@ -203,50 +220,74 @@ class DictaphoneWindow(ctk.CTkToplevel):
         self._mode = "idle"                # idle / recording / paused
         self._lang = "Авто"
         self._context = ""                 # уже набранный текст (для склейки и подсказки Whisper)
+        self._dirty = False                # есть несохранённый текст
 
         # процесс распознавания и связь с ним
+        self._booted = False
         self._worker_running = True
         self._proc = None
         self._conn = None
         self._listener = None
         self._addr = None
+        self._logf = None
         self._model_ready = False
 
         self._build()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_ui)
-        # процесс распознавания стартуем сразу и заранее прогреваем модель,
-        # чтобы к первому «Старту» всё было готово
-        threading.Thread(target=self._boot_worker, daemon=True).start()
+
+    def activate(self):
+        """Страницу открыли: заранее поднимаем процесс и прогреваем модель,
+        чтобы к первому «Начать запись» всё было готово."""
+        if not self._booted:
+            self._booted = True
+            threading.Thread(target=self._boot_worker, daemon=True).start()
 
     # ---------- интерфейс ----------
     def _build(self):
-        top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=16, pady=(14, 6))
-        ctk.CTkLabel(top, text="🎤  Диктофон",
-                     font=ctk.CTkFont(size=20, weight="bold")).pack(side="left")
-        self.lang_seg = ctk.CTkSegmentedButton(top, values=list(LANG_MAP), command=self._set_lang)
-        self.lang_seg.set("Авто"); self.lang_seg.pack(side="right")
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.pack(fill="x", padx=28, pady=(22, 0))
+        T.label(head, "Диктофон", size=22, bold=True).pack(side="left")
+        self.lang_seg = T.Segmented(head, list(LANG_MAP), command=self._set_lang)
+        self.lang_seg.pack(side="right")
+        T.label(head, "Язык", size=13, color=T.MUTED).pack(side="right", padx=(0, 10))
+        T.label(self, "Говорите — текст появляется по мере речи. Всё распознаётся на этом Mac, "
+                      "в сеть ничего не уходит.", size=13, color=T.MUTED, anchor="w"
+                ).pack(fill="x", padx=28, pady=(2, 14))
 
-        ctl = ctk.CTkFrame(self, fg_color="transparent"); ctl.pack(fill="x", padx=16, pady=(2, 6))
-        self.start_btn = ctk.CTkButton(ctl, text="●  Старт", width=130, command=self._toggle_start)
+        ctl = T.card(self)
+        ctl.pack(fill="x", padx=28)
+        row = ctk.CTkFrame(ctl, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=12)
+        self.start_btn = T.button(row, "Начать запись", "mic", kind="primary", width=170,
+                                  command=self._toggle_start)
         self.start_btn.pack(side="left")
-        self._btn_fg = self.start_btn.cget("fg_color")
-        self._btn_hover = self.start_btn.cget("hover_color")
-        self.pause_btn = ctk.CTkButton(ctl, text="⏸  Пауза", width=130, fg_color="gray",
-                                       command=self._toggle_pause, state="disabled")
+        self.pause_btn = T.button(row, "Пауза", "pause", width=130, command=self._toggle_pause,
+                                  state="disabled")
         self.pause_btn.pack(side="left", padx=8)
-        self.level = ctk.CTkProgressBar(ctl); self.level.set(0)
-        self.level.pack(side="left", fill="x", expand=True, padx=(12, 0))
+        self.level = ctk.CTkProgressBar(row, height=6)
+        self.level.set(0)
+        self.level.pack(side="left", fill="x", expand=True, padx=(10, 14))
+        self.chip = T.chip(row)
+        self.chip.pack(side="right")
+        self._status("loading")
 
-        self.text = ctk.CTkTextbox(self, font=ctk.CTkFont(size=15), wrap="word")
-        self.text.pack(fill="both", expand=True, padx=16, pady=6)
+        box = T.card(self)
+        box.pack(fill="both", expand=True, padx=28, pady=12)
+        self.text = ctk.CTkTextbox(box, font=T.font(16), wrap="word", fg_color="transparent",
+                                   border_width=0, spacing2=4, spacing3=8)
+        self.text.pack(fill="both", expand=True, padx=12, pady=10)
 
-        bottom = ctk.CTkFrame(self, fg_color="transparent"); bottom.pack(fill="x", padx=16, pady=(0, 12))
-        ctk.CTkButton(bottom, text="Копировать", width=110, command=self._copy).pack(side="left")
-        ctk.CTkButton(bottom, text="Сохранить…", width=110, command=self._save).pack(side="left", padx=8)
-        ctk.CTkButton(bottom, text="Очистить", width=100, fg_color="gray", command=self._clear).pack(side="left")
-        self.status = ctk.CTkLabel(bottom, text="Загружаю модель…", text_color="gray"); self.status.pack(side="right")
+        bottom = ctk.CTkFrame(self, fg_color="transparent")
+        bottom.pack(fill="x", padx=28, pady=(0, 18))
+        T.button(bottom, "Копировать", "copy", width=130, command=self._copy).pack(side="left")
+        T.button(bottom, "Сохранить…", "save", width=130, command=self._save).pack(side="left", padx=8)
+        T.button(bottom, "Очистить", "trash-2", kind="ghost", width=110, command=self._clear).pack(side="left")
+        self.words = T.label(bottom, "", size=12, color=T.FAINT)
+        self.words.pack(side="right")
+
+    def _status(self, key, text=None):
+        t, kind = _ST.get(key, (key, "neutral"))
+        T.set_chip(self.chip, text or t, kind)
 
     def _set_lang(self, v):
         self._lang = v
@@ -271,10 +312,10 @@ class DictaphoneWindow(ctk.CTkToplevel):
             else:
                 cmd = [sys.executable, "--dictaphone-worker",
                        self._addr, authkey.hex(), self.model_repo]
-            # вывод воркера пишем в лог рядом с кодом — для диагностики
+            # вывод воркера — в ~/Library/Logs/Scribe (открывается в «Консоли»)
             try:
-                self._logf = open(os.path.join(src_dir, "_worker.log"),
-                                  "w", encoding="utf-8")
+                LOG_DIR.mkdir(parents=True, exist_ok=True)
+                self._logf = open(LOG_DIR / "dictaphone.log", "w", encoding="utf-8")
             except Exception:
                 self._logf = subprocess.DEVNULL
             self._proc = subprocess.Popen(cmd, stdout=self._logf, stderr=self._logf)
@@ -305,7 +346,7 @@ class DictaphoneWindow(ctk.CTkToplevel):
             prompt = self._context[-200:] if self._context.strip() else PUNCT_PROMPT
             try:
                 self._conn.send((audio, LANG_MAP.get(self._lang), prompt))
-                self.ui_q.put(("status", ("Распознаю…", "#f08c00")))
+                self.ui_q.put(("status", "busy"))
             except Exception:
                 break
 
@@ -321,13 +362,12 @@ class DictaphoneWindow(ctk.CTkToplevel):
                 if piece:
                     self.ui_q.put(("text", piece))
                 if self._mode == "recording":
-                    self.ui_q.put(("status", ("Слушаю…", "#2f9e44")))
+                    self.ui_q.put(("status", "listen"))
             elif kind == "error":
                 self.ui_q.put(("error", f"Ошибка распознавания: {val}"))
             elif kind == "warmed":
                 self._model_ready = True
-                if self._mode == "idle":
-                    self.ui_q.put(("status", ("Готов к диктовке", "gray")))
+                self.ui_q.put(("status", "ready" if self._mode == "idle" else "listen"))
 
     def _append_piece(self, txt):
         """Готовим кусок к вставке: склеиваем с уже набранным как продолжение
@@ -347,7 +387,14 @@ class DictaphoneWindow(ctk.CTkToplevel):
         self._context = (self._context + piece)[-2000:]
         return piece
 
-    def _shutdown_worker(self):
+    def shutdown(self):
+        """Закрытие приложения: остановить запись и процесс распознавания."""
+        try:
+            self._mode = "idle"
+            if self.rec:
+                self.rec.stop()
+        except Exception:
+            pass
         self._worker_running = False
         try:
             if self._conn:
@@ -371,6 +418,12 @@ class DictaphoneWindow(ctk.CTkToplevel):
         except Exception:
             pass
 
+    def has_unsaved(self):
+        return self._dirty and bool(self.text.get("1.0", "end").strip())
+
+    def is_recording(self):
+        return self._mode != "idle"
+
     # ---------- управление записью ----------
     def _toggle_start(self):
         if self._mode == "idle":
@@ -384,46 +437,49 @@ class DictaphoneWindow(ctk.CTkToplevel):
         except Exception:
             messagebox.showinfo(
                 "Нужен модуль микрофона",
-                "Установите один раз:\n\nbrew install portaudio\n"
-                "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 "
-                "-m pip install sounddevice")
+                "Установите один раз в Терминале:\n\nbrew install portaudio\n"
+                f"\"{sys.executable}\" -m pip install sounddevice")
             return
+        self.activate()
         self._mode = "recording"
-        self.start_btn.configure(text="⏹  Стоп", fg_color="#c0392b", hover_color="#a5342a")
-        self.pause_btn.configure(state="normal", text="⏸  Пауза")
-        self.status.configure(
-            text="Слушаю…" if self._model_ready else "Слушаю… (модель загружается)",
-            text_color="#2f9e44")
+        self.start_btn.configure(text="Остановить")
+        T.restyle(self.start_btn, "danger", "square")
+        self.pause_btn.configure(state="normal", text="Пауза", image=T.icon("pause"))
+        self._status("listen" if self._model_ready else "listen_wait")
         self.rec = MicRecorder(self.phrase_q, level_cb=lambda v: self.ui_q.put(("level", v)))
         try:
             self.rec.start()
         except Exception as e:
             self._mode = "idle"
-            self.start_btn.configure(text="●  Старт", fg_color=self._btn_fg, hover_color=self._btn_hover)
-            self.pause_btn.configure(state="disabled")
+            self._reset_buttons()
             messagebox.showerror("Микрофон", f"Не удалось открыть микрофон:\n{e}\n\n"
-                                 "Проверьте разрешение на доступ к микрофону в «Системных настройках».")
+                                 "Проверьте доступ к микрофону: Системные настройки → "
+                                 "Конфиденциальность и безопасность → Микрофон.")
             return
+
+    def _reset_buttons(self):
+        self.start_btn.configure(text="Начать запись")
+        T.restyle(self.start_btn, "primary", "mic")
+        self.pause_btn.configure(state="disabled", text="Пауза", image=T.icon("pause"))
 
     def _stop(self):
         self._mode = "idle"
         if self.rec:
             self.rec.stop()            # флашит последнюю фразу в очередь
-        self.start_btn.configure(text="●  Старт", fg_color=self._btn_fg, hover_color=self._btn_hover)
-        self.pause_btn.configure(state="disabled", text="⏸  Пауза")
+        self._reset_buttons()
         self.level.set(0)
-        self.status.configure(text="Остановлено", text_color="gray")
+        self._status("stopped")
 
     def _toggle_pause(self):
         if self._mode == "recording":
             self._mode = "paused"; self.rec.paused = True
             self.rec.flush_now()           # закрыть текущую фразу сразу
-            self.pause_btn.configure(text="▶  Продолжить")
-            self.status.configure(text="Пауза", text_color="orange")
+            self.pause_btn.configure(text="Продолжить", image=T.icon("play"))
+            self._status("paused")
         elif self._mode == "paused":
             self._mode = "recording"; self.rec.paused = False
-            self.pause_btn.configure(text="⏸  Пауза")
-            self.status.configure(text="Слушаю…", text_color="#2f9e44")
+            self.pause_btn.configure(text="Пауза", image=T.icon("pause"))
+            self._status("listen")
 
     # ---------- обновление UI ----------
     def _drain_ui(self):
@@ -433,23 +489,28 @@ class DictaphoneWindow(ctk.CTkToplevel):
                 if kind == "text":
                     self.text.insert("end", val)   # кусок уже со своим разделителем
                     self.text.see("end")
+                    self._dirty = True
+                    self._count_words()
                 elif kind == "level":
                     self.level.set(min(1.0, val * 20))
                 elif kind == "status":
-                    txt, color = val
-                    self.status.configure(text=txt, text_color=color)
+                    self._status(val)
                 elif kind == "error":
-                    self.status.configure(text=val, text_color="red")
+                    T.set_chip(self.chip, val, "bad")
         except queue.Empty:
             pass
         self.after(100, self._drain_ui)
+
+    def _count_words(self):
+        n = len(self.text.get("1.0", "end").split())
+        self.words.configure(text=f"{n} слов" if n else "")
 
     # ---------- действия ----------
     def _copy(self):
         t = self.text.get("1.0", "end").strip()
         if t:
             self.clipboard_clear(); self.clipboard_append(t)
-            self.status.configure(text="Скопировано в буфер", text_color="gray")
+            T.set_chip(self.chip, "Скопировано", "ok")
 
     def _save(self):
         t = self.text.get("1.0", "end").strip()
@@ -469,20 +530,16 @@ class DictaphoneWindow(ctk.CTkToplevel):
                 doc.save(path)
             else:
                 Path(path).write_text(t + "\n", encoding="utf-8")
-            self.status.configure(text="Сохранено", text_color="green")
+            self._dirty = False
+            T.set_chip(self.chip, "Сохранено", "ok")
         except Exception as e:
             messagebox.showerror("Ошибка сохранения", str(e))
 
     def _clear(self):
+        if self.has_unsaved() and not messagebox.askyesno(
+                "Очистить", "Текст не сохранён. Очистить всё равно?", parent=self):
+            return
         self.text.delete("1.0", "end")
         self._context = ""
-
-    def _on_close(self):
-        try:
-            self._mode = "idle"
-            if self.rec:
-                self.rec.stop()
-        except Exception:
-            pass
-        self._shutdown_worker()
-        self.destroy()
+        self._dirty = False
+        self._count_words()

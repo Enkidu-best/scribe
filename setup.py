@@ -24,13 +24,13 @@ DATA_FILES = []
 OPTIONS = {
     "argv_emulation": False,          # на Apple Silicon включать нельзя, и это мешает нашему флагу воркера
     "iconfile": "scribe.icns",
-    "includes": ["dictaphone", "dictaphone_worker"],
+    "includes": ["dictaphone", "dictaphone_worker", "theme", "summary"],
     "plist": {
         "CFBundleName": "Scribe",
         "CFBundleDisplayName": "Scribe",
         "CFBundleIdentifier": "com.andrey.scribe",
-        "CFBundleShortVersionString": "2.0",
-        "CFBundleVersion": "2.0",
+        "CFBundleShortVersionString": "2.1",
+        "CFBundleVersion": "2.1",
         "NSMicrophoneUsageDescription":
             "Scribe использует микрофон для диктовки речи в текст.",
         "NSHighResolutionCapable": True,
