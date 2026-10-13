@@ -17,7 +17,6 @@ _old_*.wav
 _Архив*/
 _На удаление/
 *.docx
-HANDOFF.md
 ml_fast_prototype.py
 *.app
 *.textClipping
@@ -27,5 +26,9 @@ build/
 dist/
 *.spec
 
-# лог диктофонного воркера
+# лог диктофонного воркера (старое место; теперь ~/Library/Logs/Scribe)
 _worker.log
+
+# тестовый набор (собирается tests/make_test_audio.py)
+tests/audio/
+tests/results/

@@ -5,7 +5,7 @@
 
 Зачем alias-режим: приложение НЕ копирует внутрь тяжёлые пакеты (mlx, torch,
 numpy и т.д.), а ссылается на уже установленные в этом Python. Поэтому .app
-получается лёгким и собирается быстро. Минус — работает только на этой машине
+получается лёгким и собирается быстро. Минус - работает только на этой машине
 (ссылки на локальные пути). Для личного приложения это ровно то, что нужно.
 
 Главное, ради чего всё затевалось: Python здесь стартует ВНУТРИ процесса .app
@@ -24,13 +24,13 @@ DATA_FILES = []
 OPTIONS = {
     "argv_emulation": False,          # на Apple Silicon включать нельзя, и это мешает нашему флагу воркера
     "iconfile": "scribe.icns",
-    "includes": ["dictaphone", "dictaphone_worker", "theme", "summary"],
+    "includes": ["dictaphone", "dictaphone_worker", "theme", "summary", "multilang", "vad"],
     "plist": {
         "CFBundleName": "Scribe",
         "CFBundleDisplayName": "Scribe",
         "CFBundleIdentifier": "com.andrey.scribe",
-        "CFBundleShortVersionString": "2.1",
-        "CFBundleVersion": "2.1",
+        "CFBundleShortVersionString": "2.2",
+        "CFBundleVersion": "2.2",
         "NSMicrophoneUsageDescription":
             "Scribe использует микрофон для диктовки речи в текст.",
         "NSHighResolutionCapable": True,

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Оформление Scribe — в стиле Legal Knowledge Desk (web/static/app.css):
+Оформление Scribe - в стиле Legal Knowledge Desk (web/static/app.css):
 нейтральный фон, один акцент (тёмно-синий), тонкие границы, карточки,
 светлая и тёмная тема, системный шрифт без засечек, иконки Lucide.
 
-Цвета — пары (светлая, тёмная): customtkinter сам берёт нужную по теме.
+Цвета - пары (светлая, тёмная): customtkinter сам берёт нужную по теме.
 Иконки лежат в assets/icons как чёрные PNG-маски (отрисованы из Lucide один
 раз) и перекрашиваются здесь под цвет и тему.
 """
@@ -45,7 +45,7 @@ def font(size=14, bold=False):
 
 
 def apply():
-    """Подменяем цвета встроенной темы customtkinter на токены LKD — тогда все
+    """Подменяем цвета встроенной темы customtkinter на токены LKD - тогда все
     стандартные виджеты сразу выглядят как надо."""
     ctk.set_default_color_theme("blue")
     t = ctk.ThemeManager.theme
@@ -150,7 +150,7 @@ def label(master, text="", size=14, bold=False, color=TEXT, **kw):
 
 
 def section(master, text):
-    """Подзаголовок блока: как h4 в LKD — приглушённый, полужирный."""
+    """Подзаголовок блока: как h4 в LKD - приглушённый, полужирный."""
     return label(master, text, size=12, bold=True, color=MUTED, anchor="w")
 
 
@@ -170,7 +170,7 @@ def set_chip(ch, text, kind):
 
 
 class Segmented(ctk.CTkFrame):
-    """Переключатель-сегменты как .seg в LKD: серая подложка, выбранный — акцентом."""
+    """Переключатель-сегменты как .seg в LKD: серая подложка, выбранный - акцентом."""
 
     def __init__(self, master, values, command=None, size=13):
         super().__init__(master, fg_color=SURFACE2, border_width=1, border_color=BORDER,

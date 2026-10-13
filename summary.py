@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Краткое содержание расшифровки — отдельный документ рядом с полной расшифровкой.
+Итоги расшифровки - отдельный документ рядом с полной расшифровкой.
 
-Делается только по запросу (галочка «Краткое содержание» в окне) и полностью
+Делается только по запросу (галочка «Итоги» или кнопка «Подвести итоги») и полностью
 локально: через Ollama (та же, что у Legal Knowledge Desk), без новых
-Python-зависимостей — запросы идут через urllib.
+Python-зависимостей - запросы идут через urllib.
 
 Как работает:
-  короткая расшифровка (до ~28 тыс. знаков) — один запрос к модели;
-  длинная — сначала каждая часть сжимается в заметки, затем из заметок
+  короткая расшифровка (до ~28 тыс. знаков) - один запрос к модели;
+  длинная - сначала каждая часть сжимается в заметки, затем из заметок
   собирается итог («map → reduce»). Итог модель отдаёт строго в JSON по схеме,
-  а оформление (Word / текст) делаем сами — так документ всегда одинаковой формы.
+  а оформление (Word / текст) делаем сами - так документ всегда одинаковой формы.
 
-Полная расшифровка при этом не меняется: краткое содержание — второй файл
-«<имя> — краткое содержание.docx/.txt».
+Полная расшифровка при этом не меняется: итоги - второй файл
+«<имя> - итоги.docx/.txt».
 """
 import json
 import os
@@ -29,10 +29,10 @@ OLLAMA_URL = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip(
 if not OLLAMA_URL.startswith("http"):
     OLLAMA_URL = "http://" + OLLAMA_URL
 DEFAULT_MODEL = "qwen3.5:9b"
-# Если выбранной модели нет — берём первую установленную из этого списка.
+# Если выбранной модели нет - берём первую установленную из этого списка.
 PREFERRED = ["qwen3.5:9b", "qwen3.5:4b", "qwen3:8b", "qwen2.5:7b", "llama3.1:8b"]
 
-SINGLE_PASS_CHARS = 28000     # до этого объёма — один запрос
+SINGLE_PASS_CHARS = 28000     # до этого объёма - один запрос
 PART_CHARS = 20000            # размер части для длинных записей
 NUM_CTX = 16384               # контекст модели: части и заметки помещаются с запасом
 
@@ -67,7 +67,7 @@ def list_models():
 
 
 def ensure_ollama(stat=lambda m: None, wait=25.0):
-    """Ollama отвечает? Если нет — пробуем тихо запустить приложение Ollama и ждём."""
+    """Ollama отвечает? Если нет - пробуем тихо запустить приложение Ollama и ждём."""
     try:
         _get("/api/version", timeout=1.5)
         return True
@@ -104,14 +104,14 @@ def pick_model(wanted, available):
     return available[0] if available else None
 
 
-def _chat(model, system, user, schema=None, max_tokens=1500, cancel=lambda: False):
-    """Один запрос к /api/chat потоком — чтобы «Остановить» срабатывал сразу,
-    а не после конца генерации."""
+def _chat(model, system, user, schema=None, max_tokens=1500, cancel=lambda: False, keep_alive="5m"):
+    """Один запрос к /api/chat потоком - чтобы «Остановить» срабатывал сразу,
+    а не после конца генерации. keep_alive=0 - модель выгружается сразу после ответа."""
     body = {
         "model": model, "stream": True, "think": False,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "options": {"temperature": 0.2, "num_ctx": NUM_CTX, "num_predict": max_tokens},
-        "keep_alive": "5m",
+        "keep_alive": keep_alive,
     }
     if schema is not None:
         body["format"] = schema
@@ -148,21 +148,21 @@ SCHEMA = {
     "required": ["title", "gist", "key_points", "decisions", "action_items", "open_questions"],
 }
 
-_LANG_RULE = ("Пиши по-русски. Если вся запись на английском — пиши по-английски. "
-              "Имена, термины и цифры сохраняй как в тексте.")
+_LANG_RULE = ("Пиши по-русски. Если вся запись на английском - пиши по-английски. "
+              "Имена, термины и цифры сохраняй как в тексте. Вместо длинного тире пиши короткий дефис «-».")
 
 SYSTEM_FINAL = (
-    "Ты готовишь краткое содержание расшифровки аудиозаписи (встреча, лекция, интервью, разговор). "
+    "Ты подводишь итоги по расшифровке аудиозаписи (встреча, лекция, интервью, разговор). "
     "Опирайся только на текст, ничего не додумывай. Расшифровка сделана автоматически и может "
-    "содержать ошибки распознавания — исправляй очевидные, но не выдумывай. " + _LANG_RULE + "\n"
+    "содержать ошибки распознавания - исправляй очевидные, но не выдумывай. " + _LANG_RULE + "\n"
     "Верни JSON:\n"
-    "title — короткая тема записи (до 10 слов);\n"
-    "gist — суть в 2–4 предложениях;\n"
-    "key_points — 4–10 главных фактов и выводов, каждый одной-двумя фразами; сюда НЕ входит то, что попадёт в decisions, action_items или open_questions;\n"
-    "decisions — принятые решения и договорённости (пустой список, если их нет);\n"
-    "action_items — задачи и следующие шаги: кто — что — срок, если это прозвучало (иначе пустой список);\n"
-    "open_questions — нерешённые вопросы (пустой список, если их нет).\n"
-    "Всё, о чём договорились или что решили, — в decisions, а не в key_points. "
+    "title - короткая тема записи (до 10 слов);\n"
+    "gist - суть в 2–4 предложениях;\n"
+    "key_points - 4–10 главных фактов и выводов, каждый одной-двумя фразами; сюда НЕ входит то, что попадёт в decisions, action_items или open_questions;\n"
+    "decisions - принятые решения и договорённости (пустой список, если их нет);\n"
+    "action_items - задачи и следующие шаги: кто - что - срок, если это прозвучало (иначе пустой список);\n"
+    "open_questions - нерешённые вопросы (пустой список, если их нет).\n"
+    "Всё, о чём договорились или что решили, - в decisions, а не в key_points. "
     "Не повторяй один и тот же пункт в разных разделах.\n"
     "Если в тексте есть метки «Спикер N», указывай, кто что сказал, когда это важно."
 )
@@ -171,7 +171,7 @@ SYSTEM_PART = (
     "Ты сжимаешь часть длинной расшифровки аудиозаписи в рабочие заметки. "
     "Опирайся только на текст. " + _LANG_RULE + "\n"
     "Выпиши маркированным списком: главные тезисы; решения и договорённости; задачи "
-    "(кто — что — срок); нерешённые вопросы. Пропускай пустые разделы. Без вступлений."
+    "(кто - что - срок); нерешённые вопросы. Пропускай пустые разделы. Без вступлений."
 )
 
 
@@ -213,12 +213,12 @@ def _clean_list(v):
 
 
 def _words(s):
-    """Значимые слова по основам (первые 5 букв) — чтобы «согласованию» и «согласовывать» совпали."""
+    """Значимые слова по основам (первые 5 букв) - чтобы «согласованию» и «согласовывать» совпали."""
     return {w[:5] for w in "".join(c if c.isalnum() else " " for c in s.lower()).split() if len(w) > 3}
 
 
 def _dedupe_points(points, others, thr=0.5):
-    """Модель любит повторять решения и задачи в «Главном» — убираем такие пункты:
+    """Модель любит повторять решения и задачи в «Главном» - убираем такие пункты:
     если большая часть значимых слов пункта уже есть в одном из пунктов других разделов."""
     other_sets = [_words(o) for o in others]
     out = []
@@ -234,18 +234,19 @@ def summarize(text, model, prog=lambda f: None, stat=lambda m: None, cancel=lamb
     """Текст расшифровки -> dict по SCHEMA."""
     if len(text) <= SINGLE_PASS_CHARS:
         source = text
-        prog(-1)                     # один запрос — шкала «бежит», без процентов
+        prog(-1)                     # один запрос - шкала «бежит», без процентов
     else:
         parts = _split(text, PART_CHARS)
         notes = []
         for i, part in enumerate(parts, 1):
-            stat(f"Краткое содержание: часть {i} из {len(parts)}…")
+            stat(f"часть {i} из {len(parts)}")
             notes.append(f"Часть {i}:\n" + _chat(model, SYSTEM_PART, part, max_tokens=900, cancel=cancel))
             prog(i / (len(parts) + 1))
         source = "Заметки по частям длинной записи (по порядку):\n\n" + "\n\n".join(notes)
         prog(-1)
-    stat("Краткое содержание: собираю итог…")
-    raw = _chat(model, SYSTEM_FINAL, source, schema=SCHEMA, max_tokens=1800, cancel=cancel)
+    stat("сборка итогов")
+    # последний запрос - с keep_alive=0: Ollama сразу освобождает память (Mac на 16 ГБ)
+    raw = _chat(model, SYSTEM_FINAL, source, schema=SCHEMA, max_tokens=1800, cancel=cancel, keep_alive=0)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -260,15 +261,22 @@ def summarize(text, model, prog=lambda f: None, stat=lambda m: None, cancel=lamb
     return out
 
 
+def _dash(t):
+    """Длинное и среднее тире - в короткое: так Андрей пишет сам."""
+    return t.replace(" \u2014 ", " - ").replace(" \u2013 ", " - ").replace("\u2014", "-").replace("\u2013", "-")
+
+
 # ---------------------------------------------------------------------------
 # Оформление
 _SECTIONS = [("key_points", "Главное"), ("decisions", "Решения и договорённости"),
              ("action_items", "Задачи и следующие шаги"), ("open_questions", "Открытые вопросы")]
 
 
-def summary_path(src: Path, fmt: str) -> Path:
-    ext = ".docx" if fmt == "docx" else ".txt"
-    return src.with_name(f"{src.stem} — краткое содержание{ext}")
+def summary_path(transcript: Path) -> Path:
+    """Итоги лежат рядом с расшифровкой: Word, если она в Word, иначе .txt."""
+    transcript = Path(transcript)
+    ext = ".docx" if transcript.suffix.lower() == ".docx" else ".txt"
+    return transcript.with_name(f"{transcript.stem} - итоги{ext}")
 
 
 def _source_line(src_name, transcript_name, duration):
@@ -277,19 +285,22 @@ def _source_line(src_name, transcript_name, duration):
         m, s = divmod(int(duration), 60)
         h, m = divmod(m, 60)
         dur = f" · {h}:{m:02d}:{s:02d}" if h else f" · {m}:{s:02d}"
+    if not src_name:
+        return f"Расшифровка: {transcript_name}{dur}"
     return f"Запись: {src_name}{dur} · полная расшифровка: {transcript_name}"
 
 
 def write_summary(data, path: Path, src_name, transcript_name, duration, model):
     note = (f"Подготовлено автоматически локальной моделью {model} "
             f"{time.strftime('%d.%m.%Y')}. Сверяйте важное с полной расшифровкой.")
-    title = data.get("title") or Path(src_name).stem
+    data = {k: ([_dash(x) for x in v] if isinstance(v, list) else _dash(v)) for k, v in data.items()}
+    title = data.get("title") or Path(src_name or transcript_name).stem
     tmp = path.with_name("." + path.name + ".tmp")
     if path.suffix == ".docx":
         from docx import Document
         from docx.shared import Pt, RGBColor
         doc = Document()
-        doc.add_heading(f"Краткое содержание: {title}", level=1)
+        doc.add_heading(f"Итоги: {title}", level=1)
         p = doc.add_paragraph()
         r = p.add_run(_source_line(src_name, transcript_name, duration))
         r.italic = True; r.font.size = Pt(9); r.font.color.rgb = RGBColor(0x5f, 0x6b, 0x7a)
@@ -307,7 +318,7 @@ def write_summary(data, path: Path, src_name, transcript_name, duration, model):
         r.italic = True; r.font.size = Pt(9); r.font.color.rgb = RGBColor(0x8a, 0x94, 0xa3)
         doc.save(str(tmp))
     else:
-        lines = [f"КРАТКОЕ СОДЕРЖАНИЕ: {title}", _source_line(src_name, transcript_name, duration), ""]
+        lines = [f"ИТОГИ: {title}", _source_line(src_name, transcript_name, duration), ""]
         if data.get("gist"):
             lines += [data["gist"], ""]
         for key, head in _SECTIONS:

@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Диктофон для Scribe — живая диктовка с микрофона в реальном времени.
+Диктофон для Scribe - живая диктовка с микрофона в реальном времени.
 Страница «Диктофон» главного окна.
 
 Как работает:
-  захват микрофона (sounddevice) → нарезка речи на фразы по паузам
-  (энергетический VAD с адаптацией под уровень микрофона) → каждая
+  захват микрофона (sounddevice) → нарезка речи на фразы детектором речи
+  Silero VAD (vad.py; фраза закрывается паузой от 0,5 с, длинная речь без пауз
+  режется в самой тихой точке последних 3 с, не позже 25 с) → каждая
   законченная фраза уходит в ОТДЕЛЬНЫЙ процесс распознавания
   (dictaphone_worker.py) и возвращается текстом, который дописывается в окно.
 
 Распознавание вынесено в отдельный процесс намеренно: оно тяжёлое и держит
 Python-поток (GIL). Если бы оно шло здесь же, захват микрофона «замерзал» бы на
-время распознавания и речь терялась. В отдельном процессе захват идёт
-непрерывно — ничего не пропадает, фразы просто распознаются с небольшим
-отставанием.
+время распознавания и речь терялась. Процесс-воркер запускает и Legal Knowledge
+Desk (голосовой ввод), поэтому его протокол не меняем.
 
-Язык: «Авто» — определяется для каждой фразы отдельно (лучший вариант для
+Надёжность:
+  • воркер упал или завис - перезапускаем, неотвеченная фраза отправляется заново;
+  • микрофон пропал (отключили AirPods) - переподключаемся к устройству по умолчанию.
+
+Язык: «Авто» - определяется для каждой фразы отдельно (лучший вариант для
 живой диктовки), либо принудительно RU/EN.
 """
 import os
+import re
 import sys
+import time
 import secrets
 import tempfile
 import threading
@@ -33,22 +39,26 @@ from tkinter import filedialog, messagebox
 from pathlib import Path
 
 import theme as T
+import vad
 
 SR = 16000
-FRAME = 0.03                 # длина кадра, сек
-SILENCE_HANG = 0.6           # сколько тишины закрывает фразу, сек
-MIN_SPEECH = 0.4             # мин. речи во фразе, чтобы её распознавать, сек
-MAX_UTTER = 18.0             # принудительно закрыть слишком длинную фразу, сек
+FRAME = vad.CHUNK            # 512 отсчётов = 32 мс - кадр детектора речи
+NO_AUDIO_SEC = 1.5           # столько без кадров с микрофона - считаем, что он пропал
+ANSWER_TIMEOUT = 90.0        # столько ждём ответа воркера, потом перезапускаем
+WEAK_SPEECH = 0.4            # меньше речи по детектору - фраза под подозрением на «галлюцинацию»
 
 LANG_MAP = {"Авто": None, "Русский": "ru", "English": "en"}
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
+DEFAULT_MIC = "Системный (по умолчанию)"
 
-# Затравка для самой первой фразы (когда контекста ещё нет) — примеры с
+# Затравка для самой первой фразы (когда контекста ещё нет) - примеры с
 # пунктуацией и заглавными подсказывают Whisper ставить знаки и регистр.
 PUNCT_PROMPT = "Привет! Как дела? Хорошо, спасибо. Let's continue, okay?"
 _SENT_END = (".", "!", "?", "…")
+_SENT = re.compile(r"[^.!?…]+[.!?…]+")
 
-# Частые «галлюцинации» Whisper на тишине/шуме — не выводим их
+# Частые «галлюцинации» Whisper на тишине/шуме. Отбрасываем их, только если
+# детектор речи почти не слышал речи во фразе: настоящее «спасибо» остаётся.
 _HALLUCINATION = {
     "", ".", "..", "...", "продолжение следует...", "продолжение следует",
     "спасибо за просмотр", "спасибо за просмотр!", "спасибо.",
@@ -59,133 +69,136 @@ _HALLUCINATION = {
 }
 
 
-class PhraseSegmenter:
-    """Энергетический VAD с адаптацией под уровень микрофона.
+def last_sentence(text, limit=100):
+    """Подсказка Whisper: последнее законченное предложение, не длиннее limit знаков."""
+    text = " ".join(text.split())
+    sents = _SENT.findall(text)
+    s = sents[-1].strip() if sents else text
+    return s[-limit:].strip()
 
-    Первые ~0.5 c измеряет уровень фона, затем порог считает ОТНОСИТЕЛЬНО
-    фона (с гистерезисом), а не по фиксированному числу. Это работает и на
-    тихом встроенном микрофоне, и на громком внешнем. Логика без микрофона —
-    тестируется отдельно."""
 
-    CALIB_FRAMES = max(1, int(0.5 / FRAME))
+def input_devices():
+    """Имена микрофонов (устройств с входом)."""
+    try:
+        import sounddevice as sd
+        return [d["name"] for d in sd.query_devices() if d.get("max_input_channels", 0) > 0]
+    except Exception:
+        return []
 
-    def __init__(self):
-        self.reset()
 
-    def reset(self):
-        self._buf = []
-        self._speech = 0.0
-        self._silence = 0.0
-        self._noise = 0.0008           # низкий стартовый фон
-        self._in_speech = False
-        self._calib = []
-
-    def feed(self, frame):
-        rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2) + 1e-12))
-
-        # калибровка уровня фона по первым кадрам
-        if len(self._calib) < self.CALIB_FRAMES:
-            self._calib.append(rms)
-            if len(self._calib) == self.CALIB_FRAMES:
-                self._noise = max(1e-4, float(np.percentile(self._calib, 30)))
-            return None
-
-        on = max(self._noise * 3.0, 0.0014)    # порог начала речи
-        off = max(self._noise * 1.8, 0.0008)   # порог удержания (гистерезис)
-        thr = off if self._in_speech else on
-        out = None
-
-        if rms > thr:                          # речь
-            self._buf.append(frame)
-            self._speech += FRAME
-            self._silence = 0.0
-            self._in_speech = True
-        else:                                  # тишина
-            if not self._in_speech:            # фон обновляем только вне речи
-                self._noise = min(0.02, 0.97 * self._noise + 0.03 * rms)
-            if self._buf:
-                self._buf.append(frame)        # держим короткий хвост тишины
-                self._silence += FRAME
-                if self._silence >= SILENCE_HANG:
-                    out = self._finish()       # вернёт None, если речи было мало
-
-        if out is None and self._speech >= MAX_UTTER:
-            out = self._finish()
-        return out
-
-    def _finish(self):
-        keep = bool(self._buf) and self._speech >= MIN_SPEECH
-        audio = np.concatenate(self._buf).astype(np.float32) if keep else None
-        self._buf = []                 # сбрасываем фразу, фон (_noise) сохраняем
-        self._speech = 0.0
-        self._silence = 0.0
-        self._in_speech = False
-        return audio
-
-    def flush(self):
-        return self._finish()
+def _refresh_portaudio():
+    """PortAudio запоминает список устройств при старте - после подключения/отключения
+    наушников его нужно перечитать."""
+    try:
+        import sounddevice as sd
+        sd._terminate()
+        sd._initialize()
+    except Exception:
+        pass
 
 
 class MicRecorder:
-    """Захват микрофона в отдельном потоке + нарезка на фразы через PhraseSegmenter.
-    Готовые фразы кладёт в phrase_q."""
+    """Захват микрофона в отдельном потоке + нарезка на фразы (vad.StreamSegmenter).
+    Готовые фразы кладёт в phrase_q как dict(audio, speech). Если звук перестал
+    приходить (устройство отключили) - переподключается к устройству по умолчанию."""
 
-    def __init__(self, phrase_q, level_cb=None):
+    def __init__(self, phrase_q, level_cb=None, event_cb=None, device=None):
         self.phrase_q = phrase_q
         self.level_cb = level_cb
+        self.event_cb = event_cb or (lambda kind, val: None)
+        self.device = device           # имя устройства или None - системный
         self.running = False
         self.paused = False
         self.flush_pending = False     # закрыть текущую фразу сейчас (по «Паузе»)
-        self.seg = PhraseSegmenter()
+        self.seg = vad.StreamSegmenter()
         self._raw_q = queue.Queue()
         self._stream = None
+        self._last_frame = 0.0
+        self.device_name = ""
 
     def flush_now(self):
         """Пометить, чтобы поток захвата закрыл текущую фразу немедленно.
-        Сам flush делает поток _loop — без гонки за буфером сегментатора."""
+        Сам flush делает поток _loop - без гонки за буфером сегментатора."""
         self.flush_pending = True
 
-    def start(self):
+    def _open(self, device):
         import sounddevice as sd
-        self.running = True
-        self.paused = False
-        self.seg.reset()
-        bs = int(FRAME * SR)
 
         def cb(indata, frames, t, status):
             if self.running and not self.paused:
                 self._raw_q.put(indata[:, 0].copy())
+            self._last_frame = time.monotonic()
 
-        self._stream = sd.InputStream(samplerate=SR, channels=1, dtype="float32",
-                                      blocksize=bs, callback=cb)
+        names = input_devices()
+        dev = device if device in names else None
+        self._stream = sd.InputStream(samplerate=SR, channels=1, dtype="float32", blocksize=FRAME,
+                                      callback=cb, device=dev)
         self._stream.start()
+        self._last_frame = time.monotonic()
+        try:
+            self.device_name = sd.query_devices(dev, "input")["name"]
+        except Exception:
+            self.device_name = dev or ""
+
+    def start(self):
+        self.running = True
+        self.paused = False
+        self.seg.reset()
+        self._open(self.device)
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def _close_stream(self):
+        try:
+            self._stream.stop(); self._stream.close()
+        except Exception:
+            pass
+
+    def reconnect(self, device=None):
+        """Закрыть поток и открыть заново: выбранный микрофон, а если его нет - системный."""
+        self._close_stream()
+        _refresh_portaudio()
+        for attempt in range(10):
+            if not self.running:
+                return False
+            try:
+                self._open(device if device is not None else self.device)
+                self.event_cb("mic", self.device_name)
+                return True
+            except Exception:
+                time.sleep(0.5)
+        self.event_cb("mic_error", "Микрофон не найден")
+        return False
 
     def _loop(self):
         while self.running:
             try:
                 frame = self._raw_q.get(timeout=0.2)
             except queue.Empty:
-                if self.flush_pending:     # «Пауза» — закрыть накопленную фразу
+                if self.flush_pending:     # «Пауза» - закрыть накопленную фразу
                     self.flush_pending = False
                     tail = self.seg.flush()
                     if tail is not None:
                         self.phrase_q.put(tail)
+                stream_dead = self._stream is None or not getattr(self._stream, "active", False)
+                if self.running and (stream_dead or time.monotonic() - self._last_frame > NO_AUDIO_SEC):
+                    self.event_cb("mic_lost", "")
+                    tail = self.seg.flush()             # недосказанное не теряем
+                    if tail is not None:
+                        self.phrase_q.put(tail)
+                    self.reconnect()
                 continue
             if self.level_cb:
                 self.level_cb(float(np.sqrt(np.mean(frame ** 2) + 1e-12)))
             if self.paused:
                 continue
-            phrase = self.seg.feed(frame)
-            if phrase is not None:
-                self.phrase_q.put(phrase)
+            for k in range(0, len(frame) - FRAME + 1, FRAME):
+                phrase = self.seg.feed(frame[k:k + FRAME])
+                if phrase is not None:
+                    self.phrase_q.put(phrase)
 
     def stop(self):
         self.running = False
-        try:
-            self._stream.stop(); self._stream.close()
-        except Exception:
-            pass
+        self._close_stream()
         tail = self.seg.flush()
         if tail is not None:
             self.phrase_q.put(tail)
@@ -202,17 +215,20 @@ _ST = {
     "busy": ("Распознаю…", "warn"),
     "paused": ("Пауза", "warn"),
     "stopped": ("Остановлено", "neutral"),
+    "restart": ("Перезапускаю распознавание…", "warn"),
+    "mic_lost": ("Микрофон пропал - переподключаюсь…", "warn"),
 }
 
 
 class DictaphonePage(ctk.CTkFrame):
     """Страница «Диктофон» главного окна. Процесс распознавания поднимается при
     первом открытии страницы (activate) и живёт до закрытия приложения
-    (shutdown) — повторные заходы на страницу мгновенные."""
+    (shutdown) - повторные заходы на страницу мгновенные."""
 
-    def __init__(self, master, model_repo=DEFAULT_MODEL):
+    def __init__(self, master, model_repo=DEFAULT_MODEL, cfg=None):
         super().__init__(master, fg_color="transparent", corner_radius=0)
         self.model_repo = model_repo
+        self.cfg = cfg if cfg is not None else {}
 
         self.phrase_q = queue.Queue()      # фразы от захвата → воркеру
         self.ui_q = queue.Queue()          # события → главный поток (Tk)
@@ -220,6 +236,7 @@ class DictaphonePage(ctk.CTkFrame):
         self._mode = "idle"                # idle / recording / paused
         self._lang = "Авто"
         self._context = ""                 # уже набранный текст (для склейки и подсказки Whisper)
+        self._last_piece = ""              # чтобы одинаковую фразу подряд не вставлять дважды
         self._dirty = False                # есть несохранённый текст
 
         # процесс распознавания и связь с ним
@@ -231,6 +248,9 @@ class DictaphonePage(ctk.CTkFrame):
         self._addr = None
         self._logf = None
         self._model_ready = False
+        self._inflight = None              # фраза отправлена, ответа ещё нет - при падении шлём заново
+        self._mic_lost = False             # микрофон пропал - держим этот статус, пока не вернётся
+        self._restarts = []                # моменты перезапусков (защита от бесконечного цикла)
 
         self._build()
         self.after(100, self._drain_ui)
@@ -240,7 +260,8 @@ class DictaphonePage(ctk.CTkFrame):
         чтобы к первому «Начать запись» всё было готово."""
         if not self._booted:
             self._booted = True
-            threading.Thread(target=self._boot_worker, daemon=True).start()
+            threading.Thread(target=self._dispatch, daemon=True).start()
+        self._fill_mics()
 
     # ---------- интерфейс ----------
     def _build(self):
@@ -250,14 +271,14 @@ class DictaphonePage(ctk.CTkFrame):
         self.lang_seg = T.Segmented(head, list(LANG_MAP), command=self._set_lang)
         self.lang_seg.pack(side="right")
         T.label(head, "Язык", size=13, color=T.MUTED).pack(side="right", padx=(0, 10))
-        T.label(self, "Говорите — текст появляется по мере речи. Всё распознаётся на этом Mac, "
+        T.label(self, "Говорите - текст появляется по мере речи. Всё распознаётся на этом Mac, "
                       "в сеть ничего не уходит.", size=13, color=T.MUTED, anchor="w"
                 ).pack(fill="x", padx=28, pady=(2, 14))
 
         ctl = T.card(self)
         ctl.pack(fill="x", padx=28)
         row = ctk.CTkFrame(ctl, fg_color="transparent")
-        row.pack(fill="x", padx=14, pady=12)
+        row.pack(fill="x", padx=14, pady=(12, 6))
         self.start_btn = T.button(row, "Начать запись", "mic", kind="primary", width=170,
                                   command=self._toggle_start)
         self.start_btn.pack(side="left")
@@ -270,6 +291,18 @@ class DictaphonePage(ctk.CTkFrame):
         self.chip = T.chip(row)
         self.chip.pack(side="right")
         self._status("loading")
+        mrow = ctk.CTkFrame(ctl, fg_color="transparent")
+        mrow.pack(fill="x", padx=14, pady=(0, 12))
+        T.label(mrow, "Микрофон", 13, color=T.MUTED).pack(side="left")
+        self.mic_var = ctk.StringVar(value=self.cfg.get("mic") or DEFAULT_MIC)
+        self.mic_menu = ctk.CTkOptionMenu(mrow, variable=self.mic_var, values=[self.mic_var.get()], width=300,
+                                          height=28, font=T.font(13), dropdown_font=T.font(13),
+                                          command=self._pick_mic)
+        self.mic_menu.pack(side="left", padx=(10, 6))
+        T.button(mrow, "", "refresh-cw", kind="ghost", height=28,
+                 command=self._fill_mics).pack(side="left")
+        self.mic_note = T.label(mrow, "", 12, color=T.FAINT, anchor="w")
+        self.mic_note.pack(side="left", padx=(8, 0))
 
         box = T.card(self)
         box.pack(fill="both", expand=True, padx=28, pady=12)
@@ -292,90 +325,181 @@ class DictaphonePage(ctk.CTkFrame):
     def _set_lang(self, v):
         self._lang = v
 
-    # ---------- процесс распознавания ----------
-    def _boot_worker(self):
-        """Поднимаем процесс-воркер и слушающий сокет, ждём подключения,
-        затем запускаем потоки отправки фраз и приёма результатов."""
+    # ---------- микрофон ----------
+    def _fill_mics(self):
+        if self._mode == "idle":
+            _refresh_portaudio()
+        names = [DEFAULT_MIC] + input_devices()
+        self.mic_menu.configure(values=names)
+        if self.mic_var.get() not in names:
+            self.mic_var.set(DEFAULT_MIC)
+
+    def _pick_mic(self, name):
+        self.cfg["mic"] = None if name == DEFAULT_MIC else name
         try:
-            self._addr = os.path.join(tempfile.gettempdir(),
-                                      f"scribe_{secrets.token_hex(6)}.sock")
-            authkey = secrets.token_bytes(16)
-            self._listener = Listener(self._addr, family="AF_UNIX", authkey=authkey)
-            src_dir = os.path.dirname(os.path.abspath(__file__))
-            worker = os.path.join(src_dir, "dictaphone_worker.py")
-            # В обычном запуске и в сборке py2app (alias) sys.executable — это
-            # настоящий python: ему передаём скрипт воркера. Если это стаб
-            # приложения (полная сборка) — уходим через флаг --dictaphone-worker.
-            if os.path.basename(sys.executable).lower().startswith("python"):
-                cmd = [sys.executable, worker,
-                       self._addr, authkey.hex(), self.model_repo]
-            else:
-                cmd = [sys.executable, "--dictaphone-worker",
-                       self._addr, authkey.hex(), self.model_repo]
-            # вывод воркера — в ~/Library/Logs/Scribe (открывается в «Консоли»)
-            try:
-                LOG_DIR.mkdir(parents=True, exist_ok=True)
-                self._logf = open(LOG_DIR / "dictaphone.log", "w", encoding="utf-8")
-            except Exception:
-                self._logf = subprocess.DEVNULL
-            self._proc = subprocess.Popen(cmd, stdout=self._logf, stderr=self._logf)
-            self._conn = self._listener.accept()      # ждём подключения воркера
-            self._conn.recv()                         # ("ready", None)
-        except Exception as e:
-            self.ui_q.put(("error", f"Не удалось запустить распознавание: {e}"))
-            return
-        threading.Thread(target=self._sender, daemon=True).start()
-        threading.Thread(target=self._receiver, daemon=True).start()
+            from whisper_gui import save_config
+            save_config(self.cfg)
+        except Exception:
+            pass
+        if self.rec and self._mode != "idle":
+            self.rec.device = self.cfg["mic"]
+            threading.Thread(target=self.rec.reconnect, daemon=True).start()
 
-    def _sender(self):
-        """Берём готовые фразы и шлём воркеру. Тихую запись усиливаем."""
+    def _mic_event(self, kind, val):
+        self.ui_q.put((kind, val))
+
+    # ---------- процесс распознавания ----------
+    def _spawn(self):
+        """Поднять процесс-воркер и дождаться его подключения ("ready")."""
+        self._addr = os.path.join(tempfile.gettempdir(), f"scribe_{secrets.token_hex(6)}.sock")
+        authkey = secrets.token_bytes(16)
+        self._listener = Listener(self._addr, family="AF_UNIX", authkey=authkey)
+        src_dir = os.path.dirname(os.path.abspath(__file__))
+        worker = os.path.join(src_dir, "dictaphone_worker.py")
+        # В обычном запуске и в сборке py2app (alias) sys.executable - это
+        # настоящий python: ему передаём скрипт воркера. Если это стаб
+        # приложения (полная сборка) - уходим через флаг --dictaphone-worker.
+        if os.path.basename(sys.executable).lower().startswith("python"):
+            cmd = [sys.executable, worker, self._addr, authkey.hex(), self.model_repo]
+        else:
+            cmd = [sys.executable, "--dictaphone-worker", self._addr, authkey.hex(), self.model_repo]
+        # вывод воркера - в ~/Library/Logs/Scribe (открывается в «Консоли»)
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            self._logf = open(LOG_DIR / "dictaphone.log", "a", encoding="utf-8")
+        except Exception:
+            self._logf = subprocess.DEVNULL
+        self._proc = subprocess.Popen(cmd, stdout=self._logf, stderr=self._logf)
+        self._conn = self._listener.accept()          # ждём подключения воркера
+        self._conn.recv()                             # ("ready", None)
+
+    def _kill_worker(self):
+        for closer in (lambda: self._conn.close(), lambda: self._listener.close(),
+                       lambda: self._proc.kill(), lambda: os.remove(self._addr)):
+            try:
+                closer()
+            except Exception:
+                pass
+        self._conn = None
+        self._model_ready = False
+
+    def _restart(self, why):
+        """Воркер упал или завис: перезапуск. Неотвеченная фраза остаётся в _inflight
+        и уйдёт заново. Больше 3 перезапусков за минуту - останавливаемся."""
+        self._kill_worker()
+        now = time.monotonic()
+        self._restarts = [t for t in self._restarts if now - t < 60] + [now]
+        if len(self._restarts) > 3:
+            self.ui_q.put(("error", "Распознавание падает - см. ~/Library/Logs/Scribe/dictaphone.log"))
+            return False
+        self.ui_q.put(("status", "restart"))
+        try:
+            with open(LOG_DIR / "dictaphone.log", "a", encoding="utf-8") as f:
+                f.write(f"\n--- перезапуск воркера: {why} ---\n")
+        except Exception:
+            pass
+        return True
+
+    def _prepare(self, audio):
+        """Тихую запись усиливаем."""
+        rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2) + 1e-9))
+        if rms > 0:
+            gain = min(0.06 / rms, 45.0)
+            if gain > 1.0:
+                audio = np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+        return audio
+
+    def _prompt(self):
+        # последнее законченное предложение (до 100 знаков) - Whisper продолжает мысль
+        # в том же регистре, но не повторяет длинный хвост
+        return last_sentence(self._context) if self._context.strip() else PUNCT_PROMPT
+
+    def _dispatch(self):
+        """Единственный поток, который говорит с воркером: фраза - ответ - следующая.
+        Так подсказка всегда учитывает предыдущую фразу, а при падении воркера ясно,
+        какую фразу отправить заново."""
         while self._worker_running:
+            if self._conn is None:
+                try:
+                    self._spawn()
+                    self.ui_q.put(("status", "listen" if self._mode == "recording" else "loading"))
+                except Exception as e:
+                    if not self._restart(f"запуск: {e}"):
+                        return
+                    time.sleep(1.0)
+                    continue
+            if self._inflight is None:
+                try:
+                    item = self.phrase_q.get(timeout=0.3)
+                except queue.Empty:
+                    if self._proc is not None and self._proc.poll() is not None and self._worker_running:
+                        if not self._restart(f"процесс завершился с кодом {self._proc.returncode}"):
+                            return
+                    elif self._conn is not None and self._conn.poll(0):
+                        self._handle(*self._safe_recv())          # «warmed» и т. п.
+                    continue
+                if isinstance(item, np.ndarray):
+                    item = dict(audio=item, speech=len(item) / SR)
+                if item is None or item.get("audio") is None or item["audio"].size == 0:
+                    continue
+                self._inflight = item
+            item = self._inflight
             try:
-                audio = self.phrase_q.get(timeout=0.3)
-            except queue.Empty:
-                continue
-            if audio is None or getattr(audio, "size", 0) == 0:
-                continue
-            rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2) + 1e-9))
-            if rms > 0:
-                gain = min(0.06 / rms, 45.0)
-                if gain > 1.0:
-                    audio = np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
-            # «хвост» уже набранного текста — чтобы Whisper продолжал мысль,
-            # а не начинал каждую фразу с заглавной и точки
-            prompt = self._context[-200:] if self._context.strip() else PUNCT_PROMPT
-            try:
-                self._conn.send((audio, LANG_MAP.get(self._lang), prompt))
+                self._conn.send((self._prepare(item["audio"]), LANG_MAP.get(self._lang), self._prompt()))
                 self.ui_q.put(("status", "busy"))
-            except Exception:
-                break
-
-    def _receiver(self):
-        """Принимаем результаты распознавания от воркера."""
-        while self._worker_running:
-            try:
-                kind, val = self._conn.recv()
-            except (EOFError, OSError):
-                break
+                t0 = time.monotonic()
+                while True:
+                    if not self._conn.poll(0.5):
+                        if self._proc.poll() is not None:
+                            raise EOFError("процесс завершился")
+                        if time.monotonic() - t0 > ANSWER_TIMEOUT:
+                            raise TimeoutError("нет ответа")
+                        continue
+                    kind, val = self._conn.recv()
+                    if kind in ("text", "error"):
+                        break
+                    self._handle(kind, val)
+            except (EOFError, OSError, TimeoutError, BrokenPipeError) as e:
+                if not self._worker_running:
+                    return
+                if not self._restart(str(e) or type(e).__name__):
+                    return
+                continue                                      # _inflight уйдёт заново
+            self._inflight = None
             if kind == "text":
-                piece = self._append_piece(val)
+                piece = self._append_piece(val, item.get("speech", 9.0))
                 if piece:
                     self.ui_q.put(("text", piece))
-                if self._mode == "recording":
-                    self.ui_q.put(("status", "listen"))
-            elif kind == "error":
+            else:
                 self.ui_q.put(("error", f"Ошибка распознавания: {val}"))
-            elif kind == "warmed":
-                self._model_ready = True
-                self.ui_q.put(("status", "ready" if self._mode == "idle" else "listen"))
+            if self._mode == "recording":
+                self.ui_q.put(("status", "listen"))
 
-    def _append_piece(self, txt):
+    def _safe_recv(self):
+        try:
+            return self._conn.recv()
+        except Exception:
+            return ("lost", None)
+
+    def _handle(self, kind, val):
+        if kind == "warmed":
+            self._model_ready = True
+            self.ui_q.put(("status", "ready" if self._mode == "idle" else "listen"))
+
+    def _append_piece(self, txt, speech=9.0):
         """Готовим кусок к вставке: склеиваем с уже набранным как продолжение
-        мысли. Заглавную ставим только в начале и после конца предложения —
+        мысли. Заглавную ставим только в начале и после конца предложения -
         внутри мысли регистр оставляем как дал Whisper (с учётом контекста)."""
         raw = " ".join((txt or "").split()).strip()
-        if not raw or raw.lower() in _HALLUCINATION:
+        raw = re.sub(r"^[\s!?.,;:…-]+", "", raw)   # «! Поэтому…» - одинокая пунктуация в начале куска
+        if not re.search(r"\w", raw):
             return ""
+        if raw.lower() in _HALLUCINATION and speech < WEAK_SPEECH:
+            return ""                      # речи почти не было - это «галлюцинация» на шуме
+        norm = re.sub(r"[^\w]+", " ", raw.lower()).strip()
+        if norm and norm == self._last_piece:
+            return ""                      # та же фраза подряд - повтор Whisper, не вставляем
+        self._last_piece = norm
         ctx = self._context
         if not ctx:
             piece = raw[0].upper() + raw[1:]
@@ -446,9 +570,11 @@ class DictaphonePage(ctk.CTkFrame):
         T.restyle(self.start_btn, "danger", "square")
         self.pause_btn.configure(state="normal", text="Пауза", image=T.icon("pause"))
         self._status("listen" if self._model_ready else "listen_wait")
-        self.rec = MicRecorder(self.phrase_q, level_cb=lambda v: self.ui_q.put(("level", v)))
+        self.rec = MicRecorder(self.phrase_q, level_cb=lambda v: self.ui_q.put(("level", v)),
+                               event_cb=self._mic_event, device=self.cfg.get("mic"))
         try:
             self.rec.start()
+            self.mic_note.configure(text=self.rec.device_name)
         except Exception as e:
             self._mode = "idle"
             self._reset_buttons()
@@ -494,7 +620,20 @@ class DictaphonePage(ctk.CTkFrame):
                 elif kind == "level":
                     self.level.set(min(1.0, val * 20))
                 elif kind == "status":
-                    self._status(val)
+                    if not (self._mic_lost and val in ("listen", "busy", "listen_wait")):
+                        self._status(val)
+                elif kind == "mic_lost":
+                    self._mic_lost = True
+                    self._status("mic_lost")
+                elif kind == "mic":
+                    self._mic_lost = False
+                    self.mic_note.configure(text=val)
+                    self._fill_mics()
+                    if self._mode == "recording":
+                        T.set_chip(self.chip, f"Микрофон: {val}", "ok")
+                elif kind == "mic_error":
+                    self._mic_lost = False
+                    T.set_chip(self.chip, val, "bad")
                 elif kind == "error":
                     T.set_chip(self.chip, val, "bad")
         except queue.Empty:
