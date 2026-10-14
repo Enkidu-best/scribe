@@ -16,6 +16,8 @@
   mix_same.m4a      та же смесь целиком одним голосом
   quiet.m4a         русская речь на уровне около -35 dB (для проверки нормализации)
   dictation.m4a     ~5 мин для диктофона: с паузами, без пауз, короткое «Спасибо.»
+  english.m4a       чисто английская запись (~4 мин) - «Авто» не должен счесть её смешанной
+  english_accent.m4a то же, прочитано русским голосом (английский с русским акцентом)
 """
 import json
 import random
@@ -162,6 +164,26 @@ LONG_RU = [
     "На этом повестка исчерпана, спасибо всем за участие.",
 ]
 
+# --- английская речь для чисто английских записей ---
+EN_TALK = [
+    "Thanks for joining the call, let's go through the agenda quickly.",
+    "First, I would like to share an update on the contract review project.",
+    "We started in March with a small team of three lawyers and one analyst.",
+    "The main goal was to cut the time we spend on standard agreements.",
+    "We mapped the whole process and found several steps that nobody really needed.",
+    "Then we built a simple checklist and a library of approved clauses.",
+    "The business can now prepare most drafts without waiting for legal.",
+    "Of course, complex deals still come to us, and that is fine.",
+    "The second topic is the training program for new hires.",
+    "We recorded short videos about signatures, powers of attorney and archives.",
+    "Feedback so far has been positive, but people want more practical examples.",
+    "Let me know if you have a case that would work well for the next session.",
+    "Finally, a quick note about the budget for next year.",
+    "We expect to spend less on external counsel and a bit more on tools.",
+    "I will send the detailed numbers by the end of the week.",
+    "Does anyone have questions before we wrap up?",
+]
+
 # --- смесь в одном предложении: русская рамка + английское слово ---
 MIX = [
     ("Давай повторим слово", "apple"),
@@ -302,6 +324,17 @@ def build_mix_same(rng):
     tr.save("mix_same")
 
 
+def build_english(rng, voices=None, name="english"):
+    """Чисто английская запись (для проверки «Авто» без ложных срабатываний)."""
+    tr = Track(rng)
+    tr.pause(0.5)
+    for text in EN_TALK + LESSON_EN[:20] + INSERT_EN:
+        v = voices or EN_VOICES
+        tr.add(say(text, v[int(rng.integers(0, len(v)))], rate=int(rng.integers(170, 195))), "en", text)
+        tr.pause(float(rng.uniform(0.3, 1.2)))
+    tr.save(name)
+
+
 def build_quiet(rng):
     tr = Track(rng, noise_db=-50.0)
     tr.pause(0.5)
@@ -334,7 +367,8 @@ def build_dictation(rng):
 def main():
     rng = np.random.default_rng(22)
     random.seed(22)
-    which = set(sys.argv[1:]) or {"lesson", "long_insert", "mix", "mix_same", "quiet", "dictation"}
+    which = set(sys.argv[1:]) or {"lesson", "long_insert", "mix", "mix_same", "quiet", "dictation",
+                                  "english", "english_accent"}
     if "lesson" in which:
         build_lesson(rng)
     if "long_insert" in which:
@@ -345,6 +379,11 @@ def main():
         build_mix_same(np.random.default_rng(3))
     if "quiet" in which:
         build_quiet(rng)
+    if "english" in which:
+        build_english(np.random.default_rng(11))
+    if "english_accent" in which:
+        # английский, прочитанный русским голосом, - как английская речь с русским акцентом
+        build_english(np.random.default_rng(12), voices=[RU_VOICE], name="english_accent")
     if "dictation" in which:
         build_dictation(np.random.default_rng(5))
 

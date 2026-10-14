@@ -29,8 +29,8 @@ OPTIONS = {
         "CFBundleName": "Scribe",
         "CFBundleDisplayName": "Scribe",
         "CFBundleIdentifier": "com.andrey.scribe",
-        "CFBundleShortVersionString": "2.2",
-        "CFBundleVersion": "2.2",
+        "CFBundleShortVersionString": "2.3",
+        "CFBundleVersion": "2.3",
         "NSMicrophoneUsageDescription":
             "Scribe использует микрофон для диктовки речи в текст.",
         "NSHighResolutionCapable": True,

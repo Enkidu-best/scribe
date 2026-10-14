@@ -61,12 +61,16 @@ class PhraseLID:
     """Детектор языка и быстрое двойное распознавание на модели Whisper (MLX).
     Модель - та же, что для распознавания (ModelHolder), второй раз не грузится."""
 
-    def __init__(self, model_repo):
+    def __init__(self, model_repo, own=False):
         import mlx.core as mx
         from mlx_whisper.transcribe import ModelHolder
         from mlx_whisper.tokenizer import get_tokenizer
         self.mx = mx
-        self.model = ModelHolder.get_model(model_repo, mx.float16)
+        if own:        # своя копия (маленькая модель-сито) - не вытесняет модель распознавания из ModelHolder
+            from mlx_whisper.load_models import load_model
+            self.model = load_model(model_repo, dtype=mx.float16)
+        else:
+            self.model = ModelHolder.get_model(model_repo, mx.float16)
         nl = self.model.num_languages
         self.tok = get_tokenizer(self.model.is_multilingual, num_languages=nl)
         self.lang_id = {l: self.tok.to_language_token(l) for l in LANGS}
@@ -111,6 +115,47 @@ class PhraseLID:
             out[idx] = np.array(mx.softmax(two, axis=1))[:, 1]
             if prog:
                 prog(min(1.0, (i + len(idx)) / len(clips)))
+        return out
+
+    def top_lang(self, clips, batch=16, cancel=lambda: False):
+        """Самый вероятный язык фразы среди ВСЕХ языков Whisper и его вероятность."""
+        mx = self.mx
+        codes = list(self.tok.all_language_codes)
+        ids = list(self.tok.all_language_tokens)
+        out = [None] * len(clips)
+        order = np.argsort([len(c) for c in clips])
+        for i in range(0, len(clips), batch):
+            if cancel():
+                from summary import Cancelled
+                raise Cancelled()
+            idx = order[i:i + batch]
+            feats = self._features([clips[j] for j in idx])
+            x = mx.array([[self.tok.sot]] * len(idx))
+            lg = self.model.logits(x, feats)[:, 0].astype(mx.float32)
+            pr = np.array(mx.softmax(lg[:, mx.array(ids)], axis=1))
+            for k, j in enumerate(idx):
+                b = int(pr[k].argmax())
+                out[j] = (codes[b], float(pr[k, b]))
+        return out
+
+    def lang_probs(self, clips, langs=("ru", "en"), batch=32, cancel=lambda: False):
+        """Вероятности выбранных языков (среди всех языков Whisper) для каждой фразы."""
+        mx = self.mx
+        codes = list(self.tok.all_language_codes)
+        ids = list(self.tok.all_language_tokens)
+        cols = [codes.index(l) for l in langs]
+        out = np.zeros((len(clips), len(langs)))
+        order = np.argsort([len(c) for c in clips])
+        for i in range(0, len(clips), batch):
+            if cancel():
+                from summary import Cancelled
+                raise Cancelled()
+            idx = order[i:i + batch]
+            feats = self._features([clips[j] for j in idx])
+            x = mx.array([[self.tok.sot]] * len(idx))
+            lg = self.model.logits(x, feats)[:, 0].astype(mx.float32)
+            pr = np.array(mx.softmax(lg[:, mx.array(ids)], axis=1))
+            out[idx] = pr[:, cols]
         return out
 
     def dual(self, clip):
@@ -194,6 +239,152 @@ def get_lid(model_repo):
         _LID.clear()
         _LID[model_repo] = PhraseLID(model_repo)
     return _LID[model_repo]
+
+
+# --- проверка для «Авто»: есть ли в записи второй язык ---
+# 1) основной язык - turbo по нескольким фразам, равномерно по записи;
+# 2) сито - маленькая модель whisper-base (~25 мс на фразу, в 15-20 раз дешевле turbo) - смотрит
+#    ВСЕ фразы и отмечает подозрительные: высокая вероятность второго языка («сильные») или
+#    сито не уверено даже в основном («слабые» - так оно видит английский с русским акцентом);
+# 3) turbo перепроверяет сильные (до 40) и выборку слабых; если в выборке слабых нашёлся второй
+#    язык - и остальные слабые.
+# Замеры - tests/measure_auto.py, docs/Приёмка 2.3.md.
+SIEVE_REPO = "mlx-community/whisper-base-mlx"
+SIEVE_STRONG = 0.3     # у сита p(второй язык) от 0,3 - сильная отметка (настоящие русские фразы: от 0,77)
+SIEVE_WEAK = 0.5       # у сита p(основной язык) ниже 0,5 - слабая отметка
+VERIFY_MAX = 40        # больше фраз turbo не перепроверяет
+VERIFY_STEP = 8        # порция перепроверки
+WEAK_SAMPLE = 8
+DOM_SAMPLE = 6         # фраз для основного языка
+PROBE_MIN = 1.5        # фразы короче не смотрим: на них детектор неуверен
+PROBE_CLIP = 10.0      # для языка хватает 10 с из середины фразы
+PROBE_SURE = 0.9       # turbo подтверждает только уверенным ответом
+MIX_MIN = 2            # смешанная: не меньше двух подтверждённых фраз второго языка
+MIX_TIME = 0.02        # и они занимают не меньше 2 % времени речи (одна случайная фраза - нет)
+# запасной путь, если whisper-base недоступна: выборка фраз и только turbo
+PROBE_N, PROBE_PER_MIN, PROBE_N_MIN = 60, 8, 20
+
+_SIEVE = {}
+
+
+def _get_sieve():
+    if "lid" not in _SIEVE:
+        try:
+            _SIEVE["lid"] = PhraseLID(SIEVE_REPO, own=True)
+        except Exception:
+            _SIEVE["lid"] = None            # нет сети и модели в кэше - пойдём запасным путём
+    return _SIEVE["lid"]
+
+
+def has_language(found, lang):
+    """found - итог probe_languages: есть ли заметно речи на языке lang."""
+    k = found["confirmed"].get(lang, 0)
+    t = found["confirmed_time"].get(lang, 0.0)
+    return k >= MIX_MIN and found["speech_time"] > 0 and t / found["speech_time"] >= MIX_TIME
+
+
+def _sample(cands, n, total, shift=0.5):
+    """n фраз равномерно по времени."""
+    if len(cands) <= n:
+        return list(cands)
+    picked, used = [], set()
+    for k in range(n):
+        t = (k + shift) / n * total
+        j = min(range(len(cands)), key=lambda q: 0 if cands[q][0] <= t <= cands[q][1]
+                else min(abs(cands[q][0] - t), abs(cands[q][1] - t)))
+        if j not in used:
+            used.add(j)
+            picked.append(cands[j])
+    return picked
+
+
+def _clip(audio, a, b):
+    if b - a > PROBE_CLIP:
+        m = (a + b) / 2
+        a, b = m - PROBE_CLIP / 2, m + PROBE_CLIP / 2
+    return audio[int(a * SR):int(b * SR)]
+
+
+def probe_languages(audio, model_repo, cancel=lambda: False):
+    """Дешёвая проверка перед «Авто»: какие языки звучат в записи.
+    -> dict(mixed, dominant, other, confirmed{lang: фраз}, confirmed_time{lang: с}, speech_time, seconds, ...)"""
+    t0 = time.monotonic()
+    total = len(audio) / SR
+    phrases = vad.split_phrases(audio)
+    cands = [(a, b) for a, b in phrases if b - a >= PROBE_MIN] or phrases
+    speech = sum(b - a for a, b in cands)
+    turbo = get_lid(model_repo)
+    checked = {}                                         # фраза -> (язык, вероятность) по turbo
+
+    def verify(items):
+        items = [c for c in items if c not in checked]
+        if items:
+            checked.update(zip(items, turbo.top_lang([_clip(audio, a, b) for a, b in items], cancel=cancel)))
+
+    # 1) основной язык: если сито уверенно слышит один язык почти во всей речи - берём его,
+    #    иначе (например, английский с русским акцентом сито не узнаёт) - turbo по нескольким фразам
+    sieve = _get_sieve()
+    P = None
+    votes = {}
+    if sieve is not None:
+        P = sieve.lang_probs([_clip(audio, a, b) for a, b in cands], ("ru", "en"), cancel=cancel)
+        for lang, col in (("ru", 0), ("en", 1)):
+            t = sum(b - a for (a, b), pr in zip(cands, P) if pr[col] >= 0.5)
+            if t >= 0.8 * speech:
+                votes = {lang: t}
+    dom_by = "сито"
+    if not votes:
+        dom_by = "turbo"
+        verify(_sample(cands, DOM_SAMPLE, total))
+        for (a, b), (lang, pr) in checked.items():
+            if pr >= PROBE_SURE:
+                votes[lang] = votes.get(lang, 0.0) + (b - a)
+    dom = max(votes, key=votes.get) if votes else None
+    other = {"ru": "en", "en": "ru"}.get(dom)
+    strong = weak = []
+    if other and sieve is not None:
+        # 2) сито по всем фразам (уже посчитано): вероятности основного и второго языка
+        P = P[:, [("ru", "en").index(dom), ("ru", "en").index(other)]]
+        strong = [c for c, (pd, po) in zip(cands, P) if po >= SIEVE_STRONG]
+        weak = [c for c, (pd, po) in zip(cands, P) if po < SIEVE_STRONG and pd < SIEVE_WEAK]
+        strong.sort(key=lambda c: -P[cands.index(c)][1])
+        method = f"сито whisper-base + turbo (основной язык - {dom_by})"
+        # 3) перепроверка turbo: сильные - порциями от самых подозрительных; порция без единой
+        #    фразы второго языка - дальше (ещё менее подозрительные) не смотрим
+        for i in range(0, min(len(strong), VERIFY_MAX), VERIFY_STEP):
+            part = strong[i:i + VERIFY_STEP]
+            verify(part)
+            if not any(checked[c][0] == other and checked[c][1] >= PROBE_SURE for c in part):
+                break
+        #    слабые - выборкой по времени, тоже порциями: пока порция находит второй язык
+        first = _sample(weak, WEAK_SAMPLE, total)
+        rest = [c for c in _sample(weak, VERIFY_MAX, total) if c not in first]
+        parts = [first] + [rest[i:i + WEAK_SAMPLE] for i in range(0, len(rest), WEAK_SAMPLE)]
+        for part in parts:
+            verify(part)
+            if not any(checked[c][0] == other and checked[c][1] >= PROBE_SURE for c in part):
+                break
+    elif other:
+        method = "выборка turbo (сито недоступно)"
+        if dom_by == "сито":
+            verify(_sample(cands, DOM_SAMPLE, total))
+        verify(_sample(cands, int(min(PROBE_N, max(PROBE_N_MIN, total / 60 * PROBE_PER_MIN))), total))
+    else:
+        method = "turbo (основной язык не ru/en)"
+    confirmed, ctime, hits = {}, {}, []
+    for (a, b), (lang, pr) in sorted(checked.items()):
+        if pr >= PROBE_SURE and lang != dom:
+            confirmed[lang] = confirmed.get(lang, 0) + 1
+            ctime[lang] = ctime.get(lang, 0.0) + (b - a)
+            if lang == other:
+                hits.append((round(a, 1), round(b - a, 1), lang, round(pr, 2)))
+    dom_share = votes.get(dom, 0.0) / max(1e-9, sum(votes.values())) if dom else 0.0
+    found = dict(dominant=dom, dominant_share=round(dom_share, 3), other=other, confirmed=confirmed,
+                 confirmed_time={k: round(v, 1) for k, v in ctime.items()}, speech_time=round(speech, 1),
+                 phrases=len(cands), flagged=len(strong) + len(weak), verified=len(checked), method=method, hits=hits)
+    found["mixed"] = bool(other) and has_language(found, other)
+    found["seconds"] = round(time.monotonic() - t0, 1)
+    return found
 
 
 def plan(audio, model_repo, prog=lambda f: None, cancel=lambda: False, stats=None):

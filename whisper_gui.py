@@ -95,10 +95,11 @@ MODELS = {
 LANG_SEG = ["Авто", "Русский", "English", "Несколько"]
 LANG_CODE = {"Русский": "ru", "English": "en"}   # «Авто»/«Несколько» → None
 LANG_HINT = {
-    "Авто": "Один язык на всю запись - система сама выберет какой.",
-    "Несколько": "Русский и английский вперемешку, хоть каждые несколько секунд (урок, разговор "
-                 "с вставками) - язык определяется для каждой фразы.",
+    "Авто": "Язык определится сам; если в записи два языка, это тоже будет учтено.",
+    "Несколько": "Для записей, где точно перемешаны русский и английский: язык определяется "
+                 "для каждой фразы, без предварительной проверки.",
 }
+LANG_NAME = {"ru": "русская", "en": "английская"}
 FMT_SEG = {"Word": "docx", "Текст": "txt", "Субтитры": "srt"}
 TEXT_EXTS = {".txt", ".docx", ".srt"}      # готовые расшифровки: из них можно подвести итоги
 NSPK = {"Авто": 0, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6}
@@ -152,7 +153,7 @@ DIAR_STEPS = {"segmentation": "разбивка на фрагменты", "speak
 FORMATS_AUDIO = "MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, AIFF, WMA, M4B, AMR"
 FORMATS_VIDEO = "MP4, MOV, MKV, WEBM, WMV, AVI, FLV, 3GP, TS, MPG"
 
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 CONFIG_PATH = Path(os.path.expanduser("~/.audio2text.json"))
 # Пробуем модели по порядку: сначала новая community-1 (её тянут свежие версии
 # pyannote и она точнее), затем классическая 3.1 как запасная.
@@ -401,6 +402,38 @@ def _transcribe_array(mlx_whisper, audio, model_repo, lang, prog, cancel, initia
     return res.get("segments", [])
 
 
+def transcribe_auto(audio, model_repo, mlx_whisper, prog, cancel, stage=None, forced=None, on_mixed=None):
+    """«Авто» (2.3): сначала дешёвая проверка языков по всем фразам (multilang.probe_languages:
+    сито whisper-base + перепроверка turbo).
+    В записи есть и русский, и английский - обрабатываем как «Несколько»; иначе - один язык,
+    найденный проверкой (а не только по первым 30 с, как решал бы сам Whisper).
+    forced - язык, выбранный вручную: режим не меняем, только сообщаем о другом языке.
+    -> (segments, info)"""
+    import multilang
+    stage = stage or (lambda k, d="": None)
+    probe = multilang.probe_languages(audio, model_repo, cancel)
+    info = dict(probe=probe)
+    if forced:
+        other = {"ru": "en", "en": "ru"}[forced]
+        if probe["dominant"] == other or multilang.has_language(probe, other):
+            info["forced_other"] = other
+        lang = forced
+    elif probe["mixed"]:
+        if on_mixed:
+            on_mixed(probe)
+        info["mode"] = "mixed"
+        segs = transcribe_multilang_fast(audio, model_repo, mlx_whisper, prog, lambda m: None, cancel, stage=stage)
+        return segs, info
+    else:
+        # язык, найденный проверкой по всей записи (а не только по первым 30 с, как решил бы
+        # сам Whisper) - если проверка в нём уверена
+        lang = probe["dominant"] if probe["dominant_share"] >= 0.8 and probe["phrases"] >= 3 else None
+    info.update(mode="single", lang=lang)
+    stage("asr")
+    prog(0)
+    return _transcribe_array(mlx_whisper, audio, model_repo, lang, prog, cancel), info
+
+
 def transcribe_multilang_fast(audio, model_repo, mlx_whisper, prog, stat, cancel, stage=None, stats=None):
     """Режим «Несколько»: язык - для каждой фразы (см. multilang.py)."""
     import multilang
@@ -623,6 +656,7 @@ class Job:
         self.error = ""
         self.warn = ""
         self.row = None
+        self.info = ""             # пометка о том, как обработано (например, «смешанная запись»)
         self.kind = "text" if path.suffix.lower() in TEXT_EXTS else "audio"
         self.segments = None       # сегменты держим до закрытия окна - для «Подвести итоги»
         self.diarized = False
@@ -686,7 +720,11 @@ class FileRow(ctk.CTkFrame):
                      ).pack(side="left", padx=2)
         else:
             self.acts.grid_remove()
-        msg, color = (j.error, T.BAD) if j.state == "error" else (j.warn, T.WARN)
+        if j.state == "error":
+            msg, color = j.error, T.BAD
+        else:
+            msg = "\n".join(x for x in (j.info if j.state == "done" else "", j.warn) if x)
+            color = T.WARN if j.warn else T.ACCENT
         if msg:
             self.note.configure(text=msg, text_color=color)
             self.note.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(0, 10))
@@ -963,7 +1001,8 @@ class App:
 
     def _lang_hint(self):
         v = self.lang_seg.get()
-        self.lang_note.configure(text=LANG_HINT.get(v, f"Вся запись распознаётся как «{v}»."))
+        self.lang_note.configure(text=LANG_HINT.get(
+            v, f"Вся запись распознаётся как «{v}». Если в ней окажется и другой язык - предупредим."))
 
     def _sync_opts(self):
         """Согласовать опции между собой: без токена говорящих не включить,
@@ -1089,6 +1128,7 @@ class App:
                     name = "Подготовка звука и нормализация громкости"
                 text = f"{prefix}Шаг {keys.index(key) + 1} из {len(keys)} · {name}" + (f": {detail}" if detail else "")
             self.q.put(("stage", job, STEP_CHIP[key], text))
+        go.keys = keys
         return go
 
     def _set_status(self, text, color=T.MUTED):
@@ -1181,7 +1221,7 @@ class App:
             outs={id(j): self._out_path(j, fmt, audio_jobs) for j in pending})
         self._save_prefs()
         for j in pending:
-            j.state, j.error, j.warn, j.stage, j.out, j.summary = "queue", "", "", "", None, None
+            j.state, j.error, j.warn, j.stage, j.out, j.summary, j.info = "queue", "", "", "", None, None, ""
             j.segments, j.diarized = None, False
         self._begin_run()
         threading.Thread(target=self._worker, args=(pending, opts), daemon=True).start()
@@ -1325,9 +1365,18 @@ class App:
             segments = transcribe_multilang_fast(audio, o["model"], mlx_whisper, self._prog, lambda m: None, cancel,
                                                  stage=stage)
         else:
-            stage("asr")
-            self._prog(0)
-            segments = _transcribe_array(mlx_whisper, audio, o["model"], o["lang"], self._prog, cancel)
+            stage("prep", "проверка языков")
+
+            def on_mixed(probe):
+                stage.keys.insert(stage.keys.index("asr"), "lang")    # «Авто» стал «Несколько»: +1 шаг
+                self._job(job, info="Найдены русский и английский - обработано как смешанная запись.")
+
+            segments, info = transcribe_auto(audio, o["model"], mlx_whisper, self._prog, cancel, stage=stage,
+                                             forced=o["lang"], on_mixed=on_mixed)
+            other = info.get("forced_other")
+            if other:
+                warn.append(f"В записи есть {LANG_NAME[other]} речь - для смешанной записи выберите "
+                            "«Авто» или «Несколько».")
         del audio
 
         diar_used = False
@@ -1627,6 +1676,12 @@ def main():
     root = RootTk()
     App(root, cfg)
     root.mainloop()
+    # Окно закрыто, настройки сохранены, диктофон остановлен. Выходим без разбора C++-объектов
+    # Metal (MLX) и onnxruntime: изредка он падал с «recursive_mutex lock failed», и macOS
+    # показывала бы «Python неожиданно завершился».
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
