@@ -84,7 +84,7 @@ DIAR_STEPS = {"segmentation": "разбивка на фрагменты", "speak
 FORMATS_AUDIO = "MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, AIFF, WMA, M4B, AMR"
 FORMATS_VIDEO = "MP4, MOV, MKV, WEBM, WMV, AVI, FLV, 3GP, TS, MPG"
 
-APP_VERSION = "2.5"
+APP_VERSION = "2.6"
 CONFIG_PATH = pu.config_path()     # Mac - прежний ~/.audio2text.json; Windows/Linux - папка настроек системы
 # Пробуем модели по порядку: сначала новая community-1 (её тянут свежие версии
 # pyannote и она точнее), затем классическая 3.1 как запасная.

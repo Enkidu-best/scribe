@@ -1,7 +1,7 @@
 ; Установщик Scribe для Windows (Inno Setup 6). Собирается на GitHub Actions после PyInstaller.
 ; Ставится без прав администратора (в папку пользователя), ярлык в меню «Пуск», удаление - через «Программы».
 #ifndef AppVersion
-  #define AppVersion "2.5"
+  #define AppVersion "2.6"
 #endif
 
 [Setup]

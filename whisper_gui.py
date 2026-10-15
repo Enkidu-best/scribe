@@ -165,12 +165,12 @@ class FileRow(ctk.CTkFrame):
             self.opts_lbl.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(0, 8))
         else:
             self.opts_lbl.grid_remove()
-        est = self.app.estimate(j.duration, j) if j.kind == "audio" and j.state == "queue" else None
+        est = self.app.estimate(j.duration, j) if j.kind == "audio" and j.state in ("queue", "sched") else None
         meta = [x for x in ("готовая расшифровка" if j.kind == "text" else "", _fmt_dur(j.duration),
                             _fmt_size(j.size) if j.size else "", j.path.parent.name,
                             (f"≈ {max(10, round(est / 10) * 10)} с" if est < 90 else f"≈ {round(est / 60)} мин") + " на этом компьютере" if est else "") if x]
         self.meta.configure(text="  ·  ".join(meta))
-        kind, text = {"queue": ("neutral", "В очереди"), "run": ("acc", j.stage or "Идёт…"),
+        kind, text = {"queue": ("neutral", "Ждёт"), "sched": ("neutral", "В очереди"), "run": ("acc", j.stage or "Идёт…"),
                       "done": ("ok", "Готово"), "error": ("bad", "Ошибка"),
                       "cancel": ("warn", "Остановлено")}[j.state]
         T.set_chip(self.chip, text, kind)
@@ -333,7 +333,12 @@ class App:
         self.jobs = []
         self.q = queue.Queue()
         self.running = False
+        self.mode = "asr"               # что сейчас идёт: "asr" - расшифровка, "sum" - «Подвести итоги»
         self.cancel_evt = threading.Event()
+        self.run_queue = []             # файлы, поставленные в обработку; обработчик берёт их по одному
+        self.qlock = threading.Lock()
+        self.worker_alive = False
+        self.gen = 0                    # номер запуска обработчика: старый «готово» не сбрасывает новый
         self.start_time = None
         self.cur_job = None
         self.stage_text = ""
@@ -380,6 +385,7 @@ class App:
             root.dnd_bind("<<DropLeave>>", lambda e: self._drag(False))
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.bind("<Escape>", lambda e: self.clear_selection())
+        root.bind("<Command-a>" if pu.IS_MAC else "<Control-a>", self._select_all)
         self.root.after(120, self._drain)
         self.root.after(500, self._tick)
         self.root.after(600, self._prebuild_dict)
@@ -579,13 +585,18 @@ class App:
         self.progress.pack(side="left", fill="x", expand=True, pady=(4, 0))
         self.timer = T.label(prow, "00:00", 13, color=T.MUTED, width=54, anchor="e")
         self.timer.pack(side="right", padx=(10, 0))
-        self.status = T.label(left, "Добавьте файлы - и нажмите «Расшифровать».", 13, color=T.MUTED,
+        self.status = T.label(left, "Добавьте файлы, выберите нужные - и нажмите «Расшифровать».", 13, color=T.MUTED,
                               anchor="w")
         self.status.pack(fill="x", pady=(4, 0))
-        self.run_btn = T.button(bar, "Расшифровать", "play", kind="primary", width=200, height=42,
+        # главная кнопка - выделенные файлы; рядом спокойная «Все файлы (N)» (во время работы - «Остановить»)
+        self.run_btn = T.button(bar, "Выберите файл в списке", "play", kind="primary", width=300, height=42,
                                 size=15, command=self.start)
         self.run_btn.pack(side="right")
+        self.all_btn = T.button(bar, "Все файлы", "files", width=170, height=42, size=14,
+                                command=self._all_or_stop)
+        self.all_btn.pack(side="right", padx=(0, 10))
         self._refresh_files()
+        self._refresh_run_buttons()
         return page
 
     def _build_empty(self, parent):
@@ -783,9 +794,7 @@ class App:
         elif add:
             self.sel = [j for j in self.sel if j is not job] if job in self.sel else self.sel + [job]
             self.anchor = job
-        elif self.sel == [job]:                                   # повторный щелчок - снять выделение
-            self.sel, self.anchor = [], None
-        else:
+        else:                                                     # обычный щелчок - только этот файл
             self.sel, self.anchor = [job], job
         self._after_select()
 
@@ -799,6 +808,18 @@ class App:
             if j.row is not None and j.row.winfo_exists():
                 j.row.refresh()
         self._panel_load()
+        self._refresh_run_buttons()
+
+    def _select_all(self, event=None):
+        """Cmd/Ctrl+A - выделить все файлы (в поле ввода - как обычно, выделить текст)."""
+        w = self.root.focus_get()
+        if self.page != "files" or w is None or w.winfo_class() in ("Entry", "Text", "TEntry"):
+            return None
+        audio = [j for j in self.jobs if j.kind == "audio"]
+        if audio:
+            self.sel, self.anchor = audio, audio[0]
+            self._after_select()
+        return "break"
 
     def _panel_load(self):
         """Панель справа показывает настройки выделенного файла (первого из выделенных)
@@ -828,7 +849,7 @@ class App:
             elif locked:
                 sub, color = "Файл в работе не изменится  ·  Снять выделение", T.WARN
             elif done:
-                sub, color = "Изменить - и файл расшифруется заново  ·  Снять выделение", T.ACCENT
+                sub, color = "Изменить - и файл снова будет ждать расшифровки  ·  Снять выделение", T.ACCENT
             else:
                 sub, color = "Снять выделение", T.ACCENT
         self.panel_title.configure(text=title)
@@ -860,6 +881,7 @@ class App:
             j.row.refresh()
         if self.sel:
             self._panel_load()
+        self._refresh_run_buttons()
 
     def _job_opts(self, job, base):
         """Настройки файла для обработки - читаются в момент, когда файл берётся в работу."""
@@ -891,6 +913,7 @@ class App:
             elif path.suffix.lower() in AUDIO_EXTS or path.suffix.lower() in TEXT_EXTS:
                 found.append(path)
         have = {j.path for j in self.jobs}
+        was_empty = not self.jobs
         new = []
         for path in found:
             if path not in have:
@@ -906,10 +929,13 @@ class App:
         self._refresh_files()
         audio = [j for j in new if j.kind == "audio"]
         if audio:
-            # только что добавленные файлы выделены: поменяли язык или формат - это для них
-            self.sel, self.anchor = list(audio), audio[0]
-            self._after_select()
+            # новые файлы не выделяются (2.6): «Расшифровать» работает только с выделенными. Исключение -
+            # в пустой список добавлен ровно один файл: он выделен, и его можно сразу расшифровать
+            if was_empty and len(new) == 1:
+                self.sel, self.anchor = list(audio), audio[0]
+                self._after_select()
             threading.Thread(target=self._probe, args=(audio,), daemon=True).start()
+        self._refresh_run_buttons()
 
     def _probe(self, jobs):
         for j in jobs:
@@ -943,6 +969,7 @@ class App:
             self.sel = [j for j in self.sel if j is not job]
             self._panel_load()
         self._refresh_files()
+        self._refresh_run_buttons()
 
     def clear_files(self):
         if self.running:
@@ -953,8 +980,9 @@ class App:
         self.sel, self.anchor = [], None
         self._panel_load()
         self._refresh_files()
+        self._refresh_run_buttons()
         self.progress.set(0)
-        self._set_status("Добавьте файлы - и нажмите «Расшифровать».")
+        self._set_status("Добавьте файлы, выберите нужные - и нажмите «Расшифровать».")
 
     # ---------- статус/таймер ----------
     def _stat(self, m): self.q.put(("status", m))
@@ -1025,6 +1053,8 @@ class App:
                         job.row.refresh()
                     if job in self.sel:
                         self._panel_load()
+                    if "state" in upd:
+                        self._refresh_run_buttons()
                 elif kind == "token":
                     self._token_result(*msg[1])
                 elif kind == "engine":
@@ -1032,7 +1062,7 @@ class App:
                 elif kind == "ollama":
                     self._ollama_result(*msg[1])
                 elif kind == "done":
-                    self._finish(msg[1])
+                    self._finish(msg[1], msg[2] if len(msg) > 2 else None)
         except queue.Empty:
             pass
         self.root.after(120, self._drain)
@@ -1042,31 +1072,142 @@ class App:
         self.cfg.update({k: self.defaults[k] for k in OPT_KEYS})
         save_config(self.cfg)
 
-    def start(self):
+    # Главная кнопка - только выделенные файлы (2.6): выбрал файл, задал настройки - обрабатывается
+    # он, остальные ждут. «Все файлы (N)» - вся очередь, с подтверждением. Во время работы главная
+    # кнопка ставит выделенные файлы в очередь - они обработаются после текущего.
+    def _sel_targets(self):
+        """Что запустит главная кнопка: выделенные файлы, которые ждут (а также с ошибкой или
+        остановленные). Готовый файл - нет: чтобы расшифровать его заново, измените его настройки."""
+        return [j for j in self.sel if j.kind == "audio" and j.state in ("queue", "error", "cancel")]
+
+    def _waiting(self):
+        return [j for j in self.jobs if j.kind == "audio" and j.state == "queue"]
+
+    def _refresh_run_buttons(self):
+        t = self._sel_targets()
+        if len(t) == 1:
+            what = f": {_short(t[0].path.name, 22)}"
+        elif t:
+            what = f" ({len(t)})"
+        else:
+            what = ""
         if self.running:
-            self.cancel_evt.set()
-            self.run_btn.configure(state="disabled", text="Останавливаю…")
-            self._set_status("Останавливаю - дождусь ближайшей точки остановки…", T.WARN)
+            if self.mode == "asr" and t:
+                self.run_btn.configure(state="normal",
+                                       text=("Добавить в очередь" + what) if len(t) == 1 else f"Добавить в очередь ({len(t)})")
+                T.restyle(self.run_btn, "primary", "plus")
+            else:
+                self.run_btn.configure(state="disabled",
+                                       text="Выберите файл в списке" if self.mode == "asr" else "Идут итоги…")
+                T.restyle(self.run_btn, "primary", "plus" if self.mode == "asr" else "sparkles")
+            if self.cancel_evt.is_set():
+                self.all_btn.configure(state="disabled", text="Останавливаю…")
+            else:
+                self.all_btn.configure(state="normal", text="Остановить")
+            T.restyle(self.all_btn, "danger", "square")
+            return
+        if t:
+            self.run_btn.configure(state="normal",
+                                   text=("Расшифровать" + what) if len(t) == 1 else f"Расшифровать выбранные ({len(t)})")
+        else:
+            self.run_btn.configure(state="disabled", text="Выберите файл в списке")
+        T.restyle(self.run_btn, "primary", "play")
+        n = len(self._waiting())
+        self.all_btn.configure(state="normal" if n else "disabled", text=f"Все файлы ({n})" if n else "Все файлы")
+        T.restyle(self.all_btn, "default", "files")
+
+    def start(self):
+        """Главная кнопка: расшифровать выделенные файлы (во время работы - поставить их в очередь)."""
+        if self.running and self.mode != "asr":
             return
         if not self.jobs:
             self.add_files()
             return
-        audio_jobs = [j for j in self.jobs if j.kind == "audio"]
-        if not audio_jobs:
-            self._set_status("В списке только готовые расшифровки - для них есть «Подвести итоги».", T.WARN)
+        targets = self._sel_targets()
+        if targets:
+            self._enqueue(targets)
+
+    def _all_or_stop(self):
+        if self.running:
+            self.stop()
+        else:
+            self.start_all()
+
+    def start_all(self):
+        """«Все файлы (N)»: вся очередь «Ждёт» - после подтверждения."""
+        waiting = self._waiting()
+        if not waiting:
             return
-        pending = [j for j in audio_jobs if j.state != "done"] or audio_jobs
-        # общее для всех файлов; язык, формат, говорящие, таймкоды и итоги - у каждого свои
-        # (_job_opts, в момент, когда файл берётся в работу)
-        opts = dict(model=self.cfg.get("model_repo", MODEL_REPO), token=self.cfg.get("hf_token", ""),
-                    normalize=self.cfg.get("normalize", True),
-                    sum_model=self.cfg.get("summary_model", summary.DEFAULT_MODEL), all_jobs=list(audio_jobs))
+        n = len(waiting)
+        if self._confirm("Расшифровать все файлы",
+                         f"Расшифровать все {n} {_files_word(n)} в очереди? У каждого будут его настройки.",
+                         "Расшифровать все", "Отмена"):
+            self._enqueue(waiting)
+
+    def stop(self):
+        if not self.running:
+            return
+        self.cancel_evt.set()
+        self._set_status("Останавливаю - дождусь ближайшей точки остановки…", T.WARN)
+        self._refresh_run_buttons()
+
+    def _confirm(self, title, text, yes, no):
+        """Вопрос с понятными кнопками («Расшифровать все» / «Отмена»), а не «Да / Нет»."""
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title(title)
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        res = {"ok": False}
+        wrap = ctk.CTkFrame(dlg, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=24, pady=20)
+        T.label(wrap, text, 14, anchor="w", justify="left", wraplength=380).pack(fill="x")
+        btns = ctk.CTkFrame(wrap, fg_color="transparent")
+        btns.pack(fill="x", pady=(18, 0))
+
+        def close(ok):
+            res["ok"] = ok
+            dlg.destroy()
+        self._confirm_buttons = (T.button(btns, yes, "play", kind="primary", width=180, command=lambda: close(True)),
+                                 T.button(btns, no, kind="ghost", width=100, command=lambda: close(False)))
+        self._confirm_buttons[0].pack(side="right")
+        self._confirm_buttons[1].pack(side="right", padx=(0, 8))
+        dlg.bind("<Return>", lambda e: close(True))
+        dlg.bind("<Escape>", lambda e: close(False))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: close(False))
+        self._confirm_dlg = dlg
+        dlg.update_idletasks()                  # по центру окна Scribe
+        w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.after(50, lambda: (dlg.lift(), dlg.focus_force(), dlg.grab_set()))
+        self.root.wait_window(dlg)
+        self._confirm_dlg = None
+        return res["ok"]
+
+    def _enqueue(self, jobs):
+        """Поставить файлы в обработку. Обработчик берёт их по одному; если он уже работает -
+        файлы встанут в конец очереди."""
         self._save_prefs()
-        for j in pending:
-            j.state, j.error, j.warn, j.stage, j.out, j.summary, j.info = "queue", "", "", "", None, None, ""
+        for j in jobs:
+            j.state, j.error, j.warn, j.stage, j.out, j.summary, j.info = "sched", "", "", "", None, None, ""
             j.segments, j.diarized = None, False
-        self._begin_run()
-        threading.Thread(target=self._worker, args=(pending, opts), daemon=True).start()
+            j.row.refresh()
+        with self.qlock:
+            self.run_queue.extend(jobs)
+            spawn = not self.worker_alive
+            if spawn:
+                self.worker_alive = True
+                self.gen += 1
+                gen = self.gen
+        if not self.running:
+            self.mode = "asr"
+            self._begin_run()
+        if spawn:
+            threading.Thread(target=self._worker, args=(gen,), daemon=True).start()
+        self._refresh_run_buttons()
+        if self.sel:
+            self._panel_load()
 
     @staticmethod
     def _out_path(job, fmt, jobs):
@@ -1085,8 +1226,6 @@ class App:
         self.cancel_evt.clear()
         self.start_time = time.monotonic()
         self.stage_text = ""
-        self.run_btn.configure(text="Остановить")
-        T.restyle(self.run_btn, "danger", "square")
         self.add_btn.configure(state="disabled")
         self._refresh_files()
         self.nav["files"].configure(text="Расшифровка  ·  идёт")
@@ -1113,6 +1252,7 @@ class App:
             return
         opts = dict(sum_model=self.cfg.get("summary_model", summary.DEFAULT_MODEL))
         job.state, job.warn, job.error = "run", "", ""
+        self.mode = "sum"
         self._begin_run()
         threading.Thread(target=self._summary_worker, args=(job, opts), daemon=True).start()
 
@@ -1136,42 +1276,57 @@ class App:
             self._job(job, state="done", warn=f"Итоги не сделаны: {_first_line(e)}")
             self.q.put(("done", ("warn", "Итоги не сделаны - причина под файлом в списке.")))
 
-    def _worker(self, jobs, o):
+    def _worker(self, gen):
+        """Обработчик очереди: берёт поставленные файлы по одному, пока очередь не опустеет.
+        Настройки файла читаются в момент, когда он берётся в работу."""
         cancel = self.cancel_evt.is_set
+
+        def give_back():                        # не начатые файлы - обратно в «Ждёт»
+            with self.qlock:
+                rest = list(self.run_queue)
+                self.run_queue.clear()
+                self.worker_alive = False
+            for j in rest:
+                self._job(j, state="queue")
+            return rest
+
         try:
             self._stat("Загружаю модель…")
             import engine
             eng = engine.get_engine()
         except Exception as e:
+            give_back()
             self.q.put(("done", ("error", "Не найден движок распознавания:\n  pip install faster-whisper\n"
-                                          "(на Mac: pip install mlx-whisper)\n\n" + str(e)))); return
-        if any(j.opts.get("fmt") == "Word" for j in jobs):
-            try:
-                import docx  # noqa
-            except Exception:
-                self.q.put(("done", ("error", "Для Word нужен python-docx:\n  pip install python-docx"))); return
-        if any(j.opts.get("diar") for j in jobs) and self._diar_ready():
-            try:
-                import pyannote.audio  # noqa
-                import torch  # noqa
-            except Exception:
-                self.q.put(("done", ("error", "Для говорящих нужен pyannote:\n  pip install pyannote.audio"))); return
+                                          "(на Mac: pip install mlx-whisper)\n\n" + str(e)), gen)); return
 
-        done, failed, cancelled = [], 0, False
-        n = len(jobs)
-        for i, job in enumerate(jobs, 1):
-            if cancel():
-                cancelled = True
-                self._job(job, state="cancel")
-                continue
+        done, failed, cancelled, i = [], 0, False, 0
+        while True:
+            with self.qlock:
+                if cancel():
+                    break
+                if not self.run_queue:              # очередь пуста - заканчиваем; новые файлы после
+                    self.worker_alive = False       # этой строки запустят новый обработчик
+                    break
+                job = self.run_queue.pop(0)
+                left = len(self.run_queue)
+            i += 1
+            n = i + left
             pre = f"Файл {i} из {n} · " if n > 1 else ""
             job.locked = True                       # с этого момента настройки файла не меняются
-            jo = self._job_opts(job, o)
-            jo["out"] = self._out_path(job, jo["fmt"], o["all_jobs"])
+            base = dict(model=self.cfg.get("model_repo", MODEL_REPO), token=self.cfg.get("hf_token", ""),
+                        normalize=self.cfg.get("normalize", True),
+                        sum_model=self.cfg.get("summary_model", summary.DEFAULT_MODEL))
+            jo = self._job_opts(job, base)
+            jo["out"] = self._out_path(job, jo["fmt"], [j for j in self.jobs if j.kind == "audio"])
             keys = ["prep"] + (["lang"] if jo["multilang"] else []) + ["asr"] + (["diar"] if jo["diar"] else []) \
                 + (["sum"] if jo["summary"] else [])
             stage = self._stages(job, keys, pre, jo["normalize"])
             try:
+                if jo["fmt"] == "docx":
+                    try:
+                        import docx  # noqa
+                    except Exception:
+                        raise RuntimeError("Для Word нужен python-docx: pip install python-docx")
                 done.append(self._run_one(job, jo, eng, stage, cancel))
             except Cancelled:
                 cancelled = True
@@ -1179,7 +1334,9 @@ class App:
             except FileNotFoundError as e:
                 if "ffmpeg" in str(e) or "ffprobe" in str(e):
                     self._job(job, state="error", error="Не найден ffmpeg")
-                    self.q.put(("done", ("error", pu.FFMPEG_HINT))); return
+                    job.locked = False
+                    give_back()
+                    self.q.put(("done", ("error", pu.FFMPEG_HINT), gen)); return
                 failed += 1
                 self._job(job, state="error", error=_first_line(e))
             except Exception as e:
@@ -1188,6 +1345,9 @@ class App:
             finally:
                 job.locked = False
                 self._job(job)                      # панель и карточка: файл снова можно настраивать
+        if cancel():
+            give_back()
+            cancelled = True
 
         if done and not cancelled:
             out, summ, _ = done[0]
@@ -1196,14 +1356,14 @@ class App:
                 _open(summ)
         warned = sum(1 for _, _, w in done if w)
         if cancelled:
-            msg = ("warn", f"Остановлено. Готово файлов: {len(done)} из {n}.")
+            msg = ("warn", f"Остановлено. Готово файлов: {len(done)} из {i}.")
         elif failed:
-            msg = ("warn", f"Готово {len(done)} из {n}. Ошибки - в списке файлов.")
+            msg = ("warn", f"Готово {len(done)} из {i}. Ошибки - в списке файлов.")
         elif warned:
             msg = ("warn", f"Готово: {len(done)}. Есть предупреждения - см. список файлов.")
         else:
             msg = ("ok", f"Готово. Файлов: {len(done)}.")
-        self.q.put(("done", msg))
+        self.q.put(("done", msg, gen))
 
     def _run_one(self, job, o, eng, stage, cancel):
         t_start = time.monotonic()
@@ -1301,23 +1461,28 @@ class App:
         src = job.path.name if job.kind == "audio" else None
         return summary.write_summary(data, summary.summary_path(out), src, out.name, duration, model)
 
-    def _finish(self, payload):
+    def _finish(self, payload, gen=None):
         kind, msg = payload
+        if gen is not None and (gen != self.gen or self.worker_alive):
+            return          # пока шёл итог прежнего запуска, в очередь уже поставили новые файлы
         try: self.progress.stop()
         except Exception: pass
         self.progress.configure(mode="determinate")
         self.progress.set(1.0 if kind == "ok" else self.progress.get())
         self.running = False
         self.cur_job = None
-        self.run_btn.configure(state="normal", text="Расшифровать")
-        T.restyle(self.run_btn, "primary", "play")
         self.add_btn.configure(state="normal")
         self.nav["files"].configure(text="Расшифровка")
         for j in self.jobs:
-            if j.state in ("queue", "run"):
+            if j.state == "sched":                  # не дошла очередь - снова «Ждёт»
+                j.state = "queue"
+            elif j.state == "run":
                 j.state = "done" if j.kind == "text" else "cancel"
             j.row.refresh()
         self._refresh_files()
+        self._refresh_run_buttons()
+        if self.sel:
+            self._panel_load()
         el = int(time.monotonic() - self.start_time) if self.start_time else 0
         if kind == "error":
             self._set_status("Ошибка.", T.BAD)
