@@ -35,3 +35,4 @@ _worker.log
 # тестовый набор (собирается tests/make_test_audio.py)
 tests/audio/
 tests/results/
+_Архив/
