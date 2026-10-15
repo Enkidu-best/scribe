@@ -1,0 +1,99 @@
+name: Установщик для Windows
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["dev/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  build:
+    name: Сборка, установка, проверка
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pillow
+      - name: ffmpeg (сборка LGPL от BtbN)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $rel = gh api repos/BtbN/FFmpeg-Builds/releases/tags/latest | ConvertFrom-Json
+          $a = $rel.assets | Where-Object { $_.name -match '^ffmpeg-n8\.\d+-latest-win64-lgpl-8\.\d+\.zip$' } | Select-Object -First 1
+          if (-not $a) { $a = $rel.assets | Where-Object { $_.name -eq 'ffmpeg-master-latest-win64-lgpl.zip' } | Select-Object -First 1 }
+          Write-Host "ffmpeg: $($a.name)"
+          Invoke-WebRequest $a.browser_download_url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_x
+          $bin = (Get-ChildItem ffmpeg_x -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+          New-Item -ItemType Directory -Force packaging\ffmpeg | Out-Null
+          Copy-Item "$bin\ffmpeg.exe", "$bin\ffprobe.exe" packaging\ffmpeg\
+          $lic = Get-ChildItem ffmpeg_x -Recurse -Filter LICENSE.txt | Select-Object -First 1
+          if ($lic) { Copy-Item $lic.FullName packaging\ffmpeg\LICENSE.txt }
+          "$($a.name) - https://github.com/BtbN/FFmpeg-Builds (LGPL)" | Out-File packaging\ffmpeg\VERSION.txt -Encoding utf8
+      - name: Иконка
+        run: python -c "from PIL import Image; Image.open('scribe_1024.png').save('packaging/scribe.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+      - name: PyInstaller (папка)
+        run: pyinstaller packaging/scribe.spec --noconfirm --distpath dist --workpath build
+      - name: ffmpeg - в сборку
+        shell: pwsh
+        run: Copy-Item packaging\ffmpeg dist\Scribe\ffmpeg -Recurse
+      - name: Установщик (Inno Setup)
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}"
+          if ($v -match '^v(\d.*)$') { $v = $Matches[1] } else { $v = "2.4" }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" packaging\scribe.iss
+      - name: Размеры
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist -Filter "Scribe-Setup-*.exe" | Select-Object -First 1
+          $folder = (Get-ChildItem dist\Scribe -Recurse -File | Measure-Object -Property Length -Sum).Sum
+          $torch = (Get-ChildItem dist\Scribe -Recurse -File | Where-Object { $_.FullName -match '\\torch\\' } | Measure-Object -Property Length -Sum).Sum
+          $lines = @("Установщик: $([math]::Round($setup.Length/1MB)) МБ ($($setup.Name))",
+                     "Папка программы после установки: $([math]::Round($folder/1MB)) МБ",
+                     "  из них torch (определение говорящих): $([math]::Round($torch/1MB)) МБ")
+          $lines | Tee-Object dist\sizes.txt
+      - name: Тихая установка, расшифровка из командной строки, удаление
+        shell: pwsh
+        run: |
+          $env:PATH = "$PWD\packaging\ffmpeg;" + $env:PATH
+          $setup = Get-ChildItem dist -Filter "Scribe-Setup-*.exe" | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/DIR=C:\ScribeTest' -Wait
+          if (-not (Test-Path C:\ScribeTest\Scribe.exe)) { throw "Scribe.exe не установлен" }
+          C:\ScribeTest\scribe-cli.exe --engine
+          python -m pip install numpy
+          python tests/smoke_cli.py --exe C:\ScribeTest\scribe-cli.exe
+          if ($LASTEXITCODE -ne 0) { throw "расшифровка не прошла" }
+          Start-Process C:\ScribeTest\unins000.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          Start-Sleep -Seconds 3
+          if (Test-Path C:\ScribeTest\Scribe.exe) { throw "не удалилось" }
+          "Тихая установка, расшифровка и удаление прошли" | Tee-Object -Append dist\sizes.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Scribe-Setup
+          path: |
+            dist/Scribe-Setup-*.exe
+            dist/sizes.txt
+      - name: В релиз
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) { gh release create $tag --title "Scribe $tag" --notes "Сборка для Windows - см. README." }
+          gh release upload $tag (Get-ChildItem dist -Filter "Scribe-Setup-*.exe").FullName dist\sizes.txt --clobber

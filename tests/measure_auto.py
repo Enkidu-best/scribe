@@ -23,9 +23,22 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import multilang  # noqa: E402
-import whisper_gui as W  # noqa: E402
+import core as W  # noqa: E402 - ядро без окна (идёт и на сервере)
 
-MODEL = "mlx-community/whisper-large-v3-turbo"
+MODEL = "mlx-community/whisper-large-v3-turbo"   # на Windows/Linux движок сам берёт CTranslate2-версию
+
+
+def asr_backend(mod=None):
+    """Чем распознаёт проверяемый код: Scribe 2.4+ - движок engine.py (MLX или faster-whisper),
+    код 2.1-2.3 - модуль mlx_whisper. Плюс прогрев модели."""
+    if mod is None or hasattr(mod, "pu"):
+        import engine
+        eng = engine.get_engine()
+        eng.warmup(MODEL)
+        return eng
+    import mlx_whisper
+    mlx_whisper.transcribe(np.zeros(16000, np.float32), path_or_hf_repo=MODEL, language="ru")
+    return mlx_whisper
 EXPECT = {"lesson": True, "long_insert": True, "quiet": False, "dictation": False, "english": False,
           "english_accent": False, "mix": False, "mix_same": False}
 
@@ -38,8 +51,7 @@ def main():
     ap.add_argument("--repeat", type=int, default=3)
     ap.add_argument("names", nargs="*")
     a = ap.parse_args()
-    import mlx_whisper
-    mlx_whisper.transcribe(np.zeros(16000, np.float32), path_or_hf_repo=MODEL, language="ru")   # прогрев
+    asr = asr_backend()
     targets = [(Path(a.file).expanduser().name, Path(a.file).expanduser(), a.expect == "mixed")] if a.file else \
         [(n, HERE / "audio" / f"{n}.m4a", EXPECT.get(n)) for n in (a.names or list(EXPECT))]
     out = {}
@@ -62,10 +74,10 @@ def main():
         olds, news, probes = [], [], []
         for _ in range(a.repeat):
             t0 = time.monotonic()
-            W._transcribe_array(mlx_whisper, audio, MODEL, None, lambda f: None, lambda: False)
+            W._transcribe_array(asr, audio, MODEL, None, lambda f: None, lambda: False)
             olds.append(time.monotonic() - t0)
             t0 = time.monotonic()
-            segs, info = W.transcribe_auto(audio, MODEL, mlx_whisper, lambda f: None, lambda: False)
+            segs, info = W.transcribe_auto(audio, MODEL, asr, lambda f: None, lambda: False)
             news.append(time.monotonic() - t0)
             probes.append(info["probe"]["seconds"])
         old, new, pr = (float(np.median(x)) for x in (olds, news, probes))

@@ -25,6 +25,9 @@ ml_fast_prototype.py
 build/
 dist/
 *.spec
+!packaging/scribe.spec
+packaging/ffmpeg/
+packaging/scribe.ico
 
 # лог диктофонного воркера (старое место; теперь ~/Library/Logs/Scribe)
 _worker.log

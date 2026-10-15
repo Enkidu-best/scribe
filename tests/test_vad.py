@@ -3,12 +3,11 @@
 """
 Автотесты нарезки на фразы (vad.py) - для диктофона и режима «Несколько».
 
-Речь синтезируется системным `say` (macOS), поэтому тесты самодостаточны.
+Речь синтезируется системным голосом (tests/tts.py: say на Mac, espeak-ng на Linux,
+System.Speech на Windows), поэтому тесты самодостаточны и идут на любой системе.
 Запуск:  python3 tests/test_vad.py      (или pytest tests/test_vad.py)
 """
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -16,19 +15,18 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import vad  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tts  # noqa: E402
+
 SR = vad.SR
 _rng = np.random.default_rng(7)
 
 
-def speech(text, voice="Milena", rate=180):
-    with tempfile.TemporaryDirectory() as td:
-        f = Path(td) / "x.aiff"
-        subprocess.run(["say", "-v", voice, "-r", str(rate), "-o", str(f), text], check=True)
-        raw = subprocess.run(["ffmpeg", "-nostdin", "-i", str(f), "-ar", str(SR), "-ac", "1", "-f", "f32le",
-                              "-loglevel", "error", "-"], capture_output=True, check=True).stdout
-    a = np.frombuffer(raw, np.float32).copy()
-    idx = np.where(np.abs(a) > np.abs(a).max() * 0.02)[0]
-    return a[idx[0]:idx[-1]] * 0.5
+LANG = "ru" if "ru" in tts.available() else "en"     # на Windows-раннере - только английский голос
+
+
+def speech(text, rate=180):
+    return tts.speech(text, LANG, rate)
 
 
 def silence(sec):
@@ -49,8 +47,12 @@ def stream_phrases(audio):
     return out
 
 
-SENTENCES = ["Добрый день, начинаем запись.", "Сегодня обсудим три вопроса.",
-             "Первый вопрос касается договора аренды.", "На этом всё, спасибо."]
+SENTENCES = {"ru": ["Добрый день, начинаем запись.", "Сегодня обсудим три вопроса.",
+                    "Первый вопрос касается договора аренды.", "На этом всё, спасибо."],
+             # без запятых: голос Windows (SAPI) делает на запятой паузу 0,3-0,4 с, а файл
+             # режется по паузам от 0,3 с - вышло бы больше фраз, чем предложений
+             "en": ["Good afternoon we are starting the recording.", "Today we will discuss three questions.",
+                    "The first question is about the lease agreement.", "That is all thank you."]}[LANG]
 
 
 def test_pauses_give_phrases():
@@ -59,7 +61,8 @@ def test_pauses_give_phrases():
     for t in SENTENCES:
         parts += [speech(t), silence(1.0)]
     a = np.concatenate(parts)
-    assert len(vad.split_phrases(a)) == 4
+    fp = vad.split_phrases(a)
+    assert len(fp) == 4, fp
     ph = stream_phrases(a)
     assert len(ph) == 4, [len(p["audio"]) / SR for p in ph]
     assert all(p["speech"] > 0.5 for p in ph)
@@ -67,16 +70,19 @@ def test_pauses_give_phrases():
 
 def test_short_pause_inside_phrase():
     """Пауза 0,2 с внутри фразы диктофона не рвёт её (порог 0,5 с)."""
-    a = np.concatenate([silence(0.5), speech("Первая часть фразы"), silence(0.2),
-                        speech("и её продолжение"), silence(1.0)])
+    first, second = {"ru": ("Первая часть фразы", "и её продолжение"),
+                     "en": ("The first part of the phrase", "and its continuation")}[LANG]
+    a = np.concatenate([silence(0.5), speech(first), silence(0.2), speech(second), silence(1.0)])
     assert len(stream_phrases(a)) == 1
 
 
 def test_long_speech_cut_in_quiet_place():
     """Сплошная речь ~45 с без пауз дольше 0,5 с -> фразы не длиннее 25 с,
     разрез - в тихом месте, а не посреди слова."""
-    words = ("мы продолжаем говорить без остановки чтобы проверить как диктофон режет длинную речь "
-             "в самом тихом месте а не посреди слова").split()
+    words = {"ru": "мы продолжаем говорить без остановки чтобы проверить как диктофон режет длинную речь "
+                   "в самом тихом месте а не посреди слова",
+             "en": "we keep talking without stopping to check how the dictaphone cuts long speech "
+                   "in the quietest place and not in the middle of a word"}[LANG].split()
     parts = [silence(0.5)]
     while sum(len(p) for p in parts) < 45 * SR:
         for w in words:
@@ -104,7 +110,8 @@ def test_file_split_long_phrase():
     """В файле фраза длиннее 25 с режется (режим «Несколько»)."""
     parts = [silence(0.5)]
     while sum(len(p) for p in parts) < 40 * SR:
-        parts += [speech("сплошная речь без длинных пауз", rate=200), silence(0.1)]
+        parts += [speech({"ru": "сплошная речь без длинных пауз",
+                          "en": "continuous speech without long pauses"}[LANG], rate=200), silence(0.1)]
     a = np.concatenate(parts + [silence(0.5)])
     ph = vad.split_phrases(a)
     assert max(b - x for x, b in ph) <= vad.MAX_PHRASE + 0.01

@@ -11,6 +11,7 @@
 """
 from pathlib import Path
 
+import sys
 import customtkinter as ctk
 
 # --- токены (те же значения, что в LKD) ---
@@ -35,7 +36,8 @@ BAD_SOFT = ("#fbe7e5", "#2e1a19")
 
 RADIUS = 10
 RADIUS_SM = 8
-FAMILY = ".AppleSystemUIFont"      # системный шрифт macOS (= -apple-system в LKD)
+# системный шрифт: macOS (= -apple-system в LKD), Windows, Linux
+FAMILY = {"darwin": ".AppleSystemUIFont", "win32": "Segoe UI"}.get(sys.platform, "DejaVu Sans")
 
 ICONS = Path(__file__).with_name("assets") / "icons"
 

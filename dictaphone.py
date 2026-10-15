@@ -28,7 +28,6 @@ import re
 import sys
 import time
 import secrets
-import tempfile
 import threading
 import queue
 import subprocess
@@ -38,6 +37,7 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from pathlib import Path
 
+import platform_util as pu
 import theme as T
 import vad
 
@@ -194,6 +194,7 @@ class MicRecorder:
             for k in range(0, len(frame) - FRAME + 1, FRAME):
                 phrase = self.seg.feed(frame[k:k + FRAME])
                 if phrase is not None:
+                    phrase["t"] = time.monotonic()
                     self.phrase_q.put(phrase)
 
     def stop(self):
@@ -204,7 +205,17 @@ class MicRecorder:
             self.phrase_q.put(tail)
 
 
-LOG_DIR = Path.home() / "Library" / "Logs" / "Scribe"
+LOG_DIR = pu.log_dir()        # Mac - ~/Library/Logs/Scribe; Windows/Linux - папка логов системы
+LAG_HINT = 5.0               # текст приходит позже этого (с) - на процессоре подсказать модель поменьше
+
+
+def engine_key(model):
+    """«small», «turbo»… по ключу или имени репозитория."""
+    m = str(model).lower()
+    for k in ("small", "medium", "base", "turbo", "large-v3"):
+        if m == k or k in m.rsplit("/", 1)[-1]:
+            return k
+    return m
 
 # Состояние → (текст, вид чипа)
 _ST = {
@@ -251,6 +262,13 @@ class DictaphonePage(ctk.CTkFrame):
         self._inflight = None              # фраза отправлена, ответа ещё нет - при падении шлём заново
         self._mic_lost = False             # микрофон пропал - держим этот статус, пока не вернётся
         self._restarts = []                # моменты перезапусков (защита от бесконечного цикла)
+        self._lags = []                    # отставание текста от речи по последним фразам, с
+        self._lag_shown = 0.0
+        # на процессоре, если модель диктофона не выбрана вручную: текст отстаёт больше LAG_HINT -
+        # сами переходим на Small (на 4 ядрах turbo - 9-12 с на фразу, small - 2-4 с)
+        self.auto_small = False
+        self.on_model_switch = None        # окно: обновить выбор в Настройках и сохранить
+        self.small_ok = lambda: True       # окно: Small есть на диске или его можно скачать
 
         self._build()
         self.after(100, self._drain_ui)
@@ -271,7 +289,7 @@ class DictaphonePage(ctk.CTkFrame):
         self.lang_seg = T.Segmented(head, list(LANG_MAP), command=self._set_lang)
         self.lang_seg.pack(side="right")
         T.label(head, "Язык", size=13, color=T.MUTED).pack(side="right", padx=(0, 10))
-        T.label(self, "Говорите - текст появляется по мере речи. Всё распознаётся на этом Mac, "
+        T.label(self, f"Говорите - текст появляется по мере речи. Всё распознаётся {pu.HERE}, "
                       "в сеть ничего не уходит.", size=13, color=T.MUTED, anchor="w"
                 ).pack(fill="x", padx=28, pady=(2, 14))
 
@@ -351,9 +369,10 @@ class DictaphonePage(ctk.CTkFrame):
     # ---------- процесс распознавания ----------
     def _spawn(self):
         """Поднять процесс-воркер и дождаться его подключения ("ready")."""
-        self._addr = os.path.join(tempfile.gettempdir(), f"scribe_{secrets.token_hex(6)}.sock")
+        # Mac/Linux - сокет AF_UNIX, Windows - именованный канал AF_PIPE; сообщения те же
+        self._addr, family = pu.worker_address()
         authkey = secrets.token_bytes(16)
-        self._listener = Listener(self._addr, family="AF_UNIX", authkey=authkey)
+        self._listener = Listener(self._addr, family=family, authkey=authkey)
         src_dir = os.path.dirname(os.path.abspath(__file__))
         worker = os.path.join(src_dir, "dictaphone_worker.py")
         # В обычном запуске и в сборке py2app (alias) sys.executable - это
@@ -390,7 +409,7 @@ class DictaphonePage(ctk.CTkFrame):
         now = time.monotonic()
         self._restarts = [t for t in self._restarts if now - t < 60] + [now]
         if len(self._restarts) > 3:
-            self.ui_q.put(("error", "Распознавание падает - см. ~/Library/Logs/Scribe/dictaphone.log"))
+            self.ui_q.put(("error", f"Распознавание падает - см. {LOG_DIR / 'dictaphone.log'}"))
             return False
         self.ui_q.put(("status", "restart"))
         try:
@@ -466,6 +485,18 @@ class DictaphonePage(ctk.CTkFrame):
                     return
                 continue                                      # _inflight уйдёт заново
             self._inflight = None
+            lag = time.monotonic() - item.get("t", t0)
+            self._lags = (self._lags + [lag])[-3:]
+            switch = False
+            if len(self._lags) == 3 and sorted(self._lags)[1] > LAG_HINT:
+                if self.auto_small and engine_key(self.model_repo) != "small" and self.small_ok():
+                    switch = True
+                    self.auto_small = False
+                    self.model_repo = "small"
+                    self.ui_q.put(("switched", sorted(self._lags)[1]))
+                    self._lags = []
+                else:
+                    self.ui_q.put(("lag", sorted(self._lags)[1]))
             if kind == "text":
                 piece = self._append_piece(val, item.get("speech", 9.0))
                 if piece:
@@ -474,6 +505,8 @@ class DictaphonePage(ctk.CTkFrame):
                 self.ui_q.put(("error", f"Ошибка распознавания: {val}"))
             if self._mode == "recording":
                 self.ui_q.put(("status", "listen"))
+            if switch:                                        # следующая фраза - уже процессом с Small
+                self._kill_worker()
 
     def _safe_recv(self):
         try:
@@ -561,8 +594,7 @@ class DictaphonePage(ctk.CTkFrame):
         except Exception:
             messagebox.showinfo(
                 "Нужен модуль микрофона",
-                "Установите один раз в Терминале:\n\nbrew install portaudio\n"
-                f"\"{sys.executable}\" -m pip install sounddevice")
+                pu.MIC_HINT + f"\"{sys.executable}\" -m pip install sounddevice")
             return
         self.activate()
         self._mode = "recording"
@@ -636,6 +668,17 @@ class DictaphonePage(ctk.CTkFrame):
                     T.set_chip(self.chip, val, "bad")
                 elif kind == "error":
                     T.set_chip(self.chip, val, "bad")
+                elif kind == "switched":
+                    self._lag_shown = time.monotonic()
+                    T.set_chip(self.chip, "Текст отставал больше 5 с - диктофон перешёл на модель Small "
+                                          "(быстрее). Вернуть - в Настройках", "warn")
+                    if self.on_model_switch:
+                        self.on_model_switch("small")
+                elif kind == "lag":
+                    if time.monotonic() - self._lag_shown > 30:
+                        self._lag_shown = time.monotonic()
+                        T.set_chip(self.chip, f"Текст отстаёт на {val:.0f} с - в Настройках можно "
+                                              "выбрать модель поменьше", "warn")
         except queue.Empty:
             pass
         self.after(100, self._drain_ui)

@@ -1,0 +1,7 @@
+# Scribe без окна (сервер, проверки): только расшифровка из командной строки - scribe_cli.py
+faster-whisper>=1.1
+numpy
+onnxruntime
+python-docx
+platformdirs
+huggingface_hub

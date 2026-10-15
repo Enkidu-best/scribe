@@ -16,9 +16,17 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-import whisper_gui as W  # noqa: E402
+import core as W  # noqa: E402 - ядро без окна
 
-MODEL = "mlx-community/whisper-large-v3-turbo"
+MODEL = "mlx-community/whisper-large-v3-turbo"   # на Windows/Linux движок сам берёт CTranslate2-версию
+
+
+def asr_backend(mod=None):
+    """Движок распознавания (engine.py: MLX или faster-whisper) с прогревом."""
+    import engine
+    eng = engine.get_engine()
+    eng.warmup(MODEL)
+    return eng
 
 
 def words(t):
@@ -36,9 +44,8 @@ def wer(ref, hyp):
 
 
 def main():
-    import mlx_whisper
     names = sys.argv[1:] or ["quiet"]
-    mlx_whisper.transcribe(np.zeros(16000, np.float32), path_or_hf_repo=MODEL, language="ru")
+    asr = asr_backend()
     out = {}
     for name in names:
         gt = json.loads((HERE / "audio" / f"{name}.json").read_text(encoding="utf-8"))
@@ -47,7 +54,7 @@ def main():
             t0 = time.monotonic()
             a = W._decode_to_array(HERE / "audio" / f"{name}.m4a", norm)
             t1 = time.monotonic()
-            segs = W._transcribe_array(mlx_whisper, a, MODEL, "ru", lambda f: None, lambda: False)
+            segs = W._transcribe_array(asr, a, MODEL, "ru", lambda f: None, lambda: False)
             t2 = time.monotonic()
             hyp = " ".join(s["text"] for s in segs)
             rms = 20 * np.log10(np.sqrt(np.mean(a ** 2)) + 1e-12)

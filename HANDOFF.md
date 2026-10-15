@@ -3,24 +3,39 @@
 Документ для продолжения работы в новом чате / Claude Code: что это, как устроено,
 что уже сделано, известные ограничения и что не трогать.
 
-Текущая версия: **2.3** (октябрь 2026). История: 1.1 → 2.0 (MLX, диаризация) →
+Текущая версия: **2.4** (октябрь 2026). История: 1.1 → 2.0 (MLX, диаризация) →
 2.1 (одно окно в стиле Legal Knowledge Desk, итоги через Ollama) → 2.2 (язык для
 каждой фразы, Silero VAD, надёжный диктофон, доводка окна) → 2.3 («Авто» сам замечает
-второй язык и уходит в «Несколько»).
+второй язык и уходит в «Несколько») → 2.4 (Windows и Linux: слой движка, установщик .exe,
+офлайн-пакет моделей, командная строка).
 
 ---
 
 ## 1. Что это
 
-Настольное приложение для Mac (Apple Silicon): аудио и видео в текст **полностью
-локально**. Распознавание - Whisper large-v3-turbo через Apple MLX. Интерфейс -
+Настольное приложение для Mac (Apple Silicon), Windows и Linux: аудио и видео в текст
+**полностью локально**. Распознавание - Whisper large-v3-turbo: на Mac через Apple MLX,
+на Windows/Linux через faster-whisper (CUDA на NVIDIA, иначе процессор, int8). Интерфейс -
 customtkinter, оформление как у Legal Knowledge Desk (LKD). Автор - Андрей,
 MacBook Pro M4, 16 ГБ. Ценит скорость и минимум настроек в окне.
 
 ## 2. Файлы
 
-- `whisper_gui.py` - окно (меню: Расшифровка, Диктофон, Настройки, Тема), обработка
-  файлов, диаризация, сохранение, этапы под шкалой.
+- `whisper_gui.py` - окно (меню: Расшифровка, Диктофон, Настройки, Тема), окно
+  «Загрузка моделей», оценка времени по замерам этой машины.
+- `core.py` - всё без окна: декодирование, «Авто», «Несколько», диаризация, запись .txt/.docx/.srt.
+  Его используют окно, `scribe_cli.py` (командная строка, `scribe-cli.exe`) и замеры.
+- `engine.py` - движок: `MLXEngine` (на Mac - ровно прежние вызовы mlx_whisper) и `FWEngine`
+  (faster-whisper; CUDA float16 или CPU int8, при ошибке CUDA - сам уходит на процессор);
+  выбор - `get_engine()`, переопределение `SCRIBE_ENGINE=mlx|fw`, `SCRIBE_DEVICE=cpu|cuda`.
+  Детектор языка фраз (`lid()`) - у каждого движка свой, интерфейс один.
+- `platform_util.py` - пути (Mac - прежние; Windows/Linux - platformdirs), открыть/показать
+  файл, адрес канала диктофона (AF_UNIX / AF_PIPE), ffmpeg из сборки, DLL CUDA.
+- `models.py` - какие модели нужны, скачивание с прогрессом, «Загрузить модели из папки…»,
+  библиотеки NVIDIA (cuBLAS/cuDNN с PyPI) для Windows.
+- `packaging/` (PyInstaller + Inno Setup), `.github/workflows/` (ci.yml - проверки на
+  Windows и Linux; release.yml - установщик, тихая установка, проверка, удаление, релиз),
+  `tools/make_offline_pack.py` - офлайн-пакет моделей.
 - `multilang.py` - режим «Несколько» (RU/EN): язык для каждой фразы; проверка языков для «Авто».
 - `vad.py` - Silero VAD (ONNX, `assets/models/silero_vad.onnx`, MIT): фразы для режима
   «Несколько» и для диктофона.
@@ -31,8 +46,9 @@ MacBook Pro M4, 16 ГБ. Ценит скорость и минимум наст�
 - `theme.py` - цвета и элементы LKD; иконки Lucide в `assets/icons` (PNG-маски).
 - `tests/` - сборка тестового набора, замеры, автотесты (аудио набора в git нет).
 - `docs/` - задания и приёмка (`Приёмка 2.2.md` со снимками и таблицей замеров).
-- `~/.audio2text.json` - настройки (токен HF, последние параметры, тема, микрофон).
-- Лог диктофона - `~/Library/Logs/Scribe/dictaphone.log`.
+- Настройки: Mac `~/.audio2text.json`, Windows `%LOCALAPPDATA%\Scribe\settings.json`,
+  Linux `~/.config/Scribe/settings.json`. Лог диктофона: `~/Library/Logs/Scribe/dictaphone.log`
+  (Windows - `%LOCALAPPDATA%\Scribe\Logs`). `scribe_cli.py --engine` печатает все пути.
 
 Запуск для разработки: `/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 whisper_gui.py`.
 Сборка .app: py2app в alias-режиме (README).
@@ -111,6 +127,11 @@ MacBook Pro M4, 16 ГБ. Ценит скорость и минимум наст�
 - Живой текст при расшифровке файла не делаем - он есть в «Диктофоне».
 
 ## 7. Проверка изменений
+
+0. GitHub Actions: `ci.yml` на каждый push (Linux и Windows, процессор: автотесты нарезки и
+   `tests/smoke_cli.py`), `release.yml` на тег `v*` (установщик в релиз).
+   `python3 tests/measure_platform.py --tag <машина>` и `--compare mac linux-docker` -
+   сравнение платформ; Linux - в Docker: `tests/linux/Dockerfile`.
 
 1. `python3 tests/test_vad.py` - автотесты нарезки; `python3 tests/measure_auto.py` - решения «Авто»
    на наборе (+ `--file` для своей записи, `--timing` для времени).

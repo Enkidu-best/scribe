@@ -36,7 +36,20 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 AUDIO = HERE / "audio"
 RESULTS = HERE / "results"
-MODEL = "mlx-community/whisper-large-v3-turbo"
+MODEL = "mlx-community/whisper-large-v3-turbo"   # на Windows/Linux движок сам берёт CTranslate2-версию
+
+
+def asr_backend(mod=None):
+    """Чем распознаёт проверяемый код: Scribe 2.4+ - движок engine.py (MLX или faster-whisper),
+    код 2.1-2.3 - модуль mlx_whisper. Плюс прогрев модели."""
+    if mod is None or hasattr(mod, "pu"):
+        import engine
+        eng = engine.get_engine()
+        eng.warmup(MODEL)
+        return eng
+    import mlx_whisper
+    mlx_whisper.transcribe(np.zeros(16000, np.float32), path_or_hf_repo=MODEL, language="ru")
+    return mlx_whisper
 
 
 def norm_words(text):
@@ -61,16 +74,15 @@ def load_engine(code):
     return mod
 
 
-def run_engine(mod, path):
-    import mlx_whisper
+def run_engine(mod, path, asr):
     audio = mod._decode_to_array(Path(path), True)
     stats = {}
     t0 = time.monotonic()
     try:
-        segs = mod.transcribe_multilang_fast(audio, MODEL, mlx_whisper, lambda f: None, lambda m: None,
+        segs = mod.transcribe_multilang_fast(audio, MODEL, asr, lambda f: None, lambda m: None,
                                              lambda: False, stats=stats)
     except TypeError:                      # 2.1: без stats
-        segs = mod.transcribe_multilang_fast(audio, MODEL, mlx_whisper, lambda f: None, lambda m: None,
+        segs = mod.transcribe_multilang_fast(audio, MODEL, asr, lambda f: None, lambda m: None,
                                              lambda: False)
     dt = time.monotonic() - t0
     return segs, dt, len(audio) / 16000, stats
@@ -152,13 +164,12 @@ def main():
     a = ap.parse_args()
     os.chdir(Path(a.code).resolve().parent)
     mod = load_engine(a.code)
-    import mlx_whisper
-    mlx_whisper.transcribe(np.zeros(16000, np.float32), path_or_hf_repo=MODEL, language="ru")  # прогрев
+    asr = asr_backend(mod)
     RESULTS.mkdir(exist_ok=True)
     out = {}
     targets = [("file", os.path.expanduser(a.file))] if a.file else [(n, AUDIO / f"{n}.m4a") for n in a.names]
     for name, path in targets:
-        segs, dt, dur, stats = run_engine(mod, path)
+        segs, dt, dur, stats = run_engine(mod, path, asr)
         text = [dict(start=round(s["start"], 2), end=round(s["end"], 2), text=s["text"].strip()) for s in segs]
         if name == "file":
             words = [w for s in segs for w in norm_words(s["text"])]

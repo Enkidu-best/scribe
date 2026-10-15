@@ -18,8 +18,6 @@ Python-зависимостей - запросы идут через urllib.
 """
 import json
 import os
-import shutil
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -67,20 +65,17 @@ def list_models():
 
 
 def ensure_ollama(stat=lambda m: None, wait=25.0):
-    """Ollama отвечает? Если нет - пробуем тихо запустить приложение Ollama и ждём."""
+    """Ollama отвечает? Если нет - пробуем тихо запустить её и ждём (Mac, Windows, Linux)."""
     try:
         _get("/api/version", timeout=1.5)
         return True
     except (urllib.error.URLError, OSError):
         pass
-    started = False
-    if os.path.isdir("/Applications/Ollama.app"):
-        subprocess.run(["open", "-g", "-a", "Ollama"], check=False)
-        started = True
-    elif shutil.which("ollama"):
-        subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
-        started = True
+    try:
+        import platform_util as pu
+        started = pu.start_ollama()
+    except Exception:
+        started = False
     if not started:
         return False
     stat("Запускаю Ollama…")

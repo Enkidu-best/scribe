@@ -16,14 +16,9 @@ Scribe - локальная транскрипция аудио и видео в
 """
 
 import os
-import io
-import re
-import json
 import time
 import queue
 import threading
-import subprocess
-import contextlib
 from pathlib import Path
 import sys
 import platform
@@ -43,15 +38,19 @@ if (sys.platform == "darwin" and platform.machine() == "x86_64"
 # Поэтому процесс распознавания диктофона запускается перезапуском приложения
 # с этим флагом. Ловим его до поднятия интерфейса и уходим в воркер.
 if len(sys.argv) >= 2 and sys.argv[1] == "--dictaphone-worker":
+    import platform_util as pu
+    pu.fix_streams("dictaphone.log")
+    pu.setup_path()
+    pu.setup_cuda()
     import dictaphone_worker
     sys.argv = [sys.argv[0]] + sys.argv[2:]
     dictaphone_worker.main()
     sys.exit(0)
 
-# --- PATH: чтобы ffmpeg/ffprobe/ollama нашлись даже при запуске из Finder ---
-for _p in ("/opt/homebrew/bin", "/usr/local/bin", os.path.expanduser("~/.local/bin")):
-    if os.path.isdir(_p) and _p not in os.environ.get("PATH", "").split(os.pathsep):
-        os.environ["PATH"] = _p + os.pathsep + os.environ.get("PATH", "")
+# --- PATH: ffmpeg/ffprobe (в сборке для Windows - свои) и ollama находятся при любом запуске ---
+import platform_util as pu  # noqa: E402
+pu.fix_streams()
+pu.setup_path()
 
 try:
     import customtkinter as ctk
@@ -84,559 +83,17 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
-# Turbo - модель по умолчанию (быстрая). Large v3 доступна в Настройках как
-# опция «на всякий», но в разы медленнее при том же результате.
-MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
-MODELS = {
-    "Turbo - быстро (рекомендуется)": "mlx-community/whisper-large-v3-turbo",
-    "Large v3 - точнее, но в разы медленнее": "mlx-community/whisper-large-v3-mlx",
-}
-# Язык - сегменты; «Несколько» включает блочный мультиязычный движок.
-LANG_SEG = ["Авто", "Русский", "English", "Несколько"]
-LANG_CODE = {"Русский": "ru", "English": "en"}   # «Авто»/«Несколько» → None
-LANG_HINT = {
-    "Авто": "Язык определится сам; если в записи два языка, это тоже будет учтено.",
-    "Несколько": "Для записей, где точно перемешаны русский и английский: язык определяется "
-                 "для каждой фразы, без предварительной проверки.",
-}
-LANG_NAME = {"ru": "русская", "en": "английская"}
-FMT_SEG = {"Word": "docx", "Текст": "txt", "Субтитры": "srt"}
-TEXT_EXTS = {".txt", ".docx", ".srt"}      # готовые расшифровки: из них можно подвести итоги
-NSPK = {"Авто": 0, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6}
-
-
-def _model_title(repo):
-    for k, v in MODELS.items():
-        if v == repo:
-            return k
-    return list(MODELS)[0]
-
-
-def _models_base(cfg):
-    return cfg.get("models_dir") or os.environ.get("HF_HOME") \
-        or os.path.expanduser("~/.cache/huggingface")
-
-
-def _models_dir_path(cfg):
-    return os.path.join(_models_base(cfg), "hub")
-
-
-def _models_dir_display(cfg):
-    return _models_dir_path(cfg).replace(os.path.expanduser("~"), "~")
-
-
-def _apply_models_dir(d):
-    if d:
-        os.environ["HF_HOME"] = d
-
-AUDIO_EXTS = {
-    # аудио
-    ".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".oga", ".opus",
-    ".aiff", ".aif", ".wma", ".m4b", ".amr", ".mka", ".ape", ".wv", ".caf", ".ac3",
-    # видео
-    ".mp4", ".mov", ".m4v", ".mkv", ".webm", ".wmv", ".avi", ".flv",
-    ".3gp", ".3g2", ".ts", ".mts", ".m2ts", ".mpg", ".mpeg", ".asf", ".vob", ".ogv",
-}
-AUDIO_TYPES = [("Аудио и видео", " ".join("*" + e for e in sorted(AUDIO_EXTS))),
-               ("Готовые расшифровки", "*.txt *.docx *.srt"),
-               ("Все файлы", "*.*")]
-
-# Этапы обработки файла: строка под шкалой называет этап прямо.
-STEP_NAMES = {"prep": "Подготовка звука", "lang": "Разбивка на фразы и определение языка",
-              "asr": "Распознавание речи", "diar": "Определение говорящих", "sum": "Итоги"}
-STEP_CHIP = {"prep": "Подготовка", "lang": "Языки", "asr": "Распознавание", "diar": "Говорящие",
-             "sum": "Итоги", "save": "Сохранение"}
-DIAR_STEPS = {"segmentation": "разбивка на фрагменты", "speaker_counting": "подсчёт говорящих",
-              "embeddings": "голосовые отпечатки", "discrete_diarization": "группировка"}
-
-# Список поддерживаемых форматов - показываем в «Настройках».
-FORMATS_AUDIO = "MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, AIFF, WMA, M4B, AMR"
-FORMATS_VIDEO = "MP4, MOV, MKV, WEBM, WMV, AVI, FLV, 3GP, TS, MPG"
-
-APP_VERSION = "2.3"
-CONFIG_PATH = Path(os.path.expanduser("~/.audio2text.json"))
-# Пробуем модели по порядку: сначала новая community-1 (её тянут свежие версии
-# pyannote и она точнее), затем классическая 3.1 как запасная.
-DIAR_MODELS = [
-    "pyannote/speaker-diarization-community-1",
-    "pyannote/speaker-diarization-3.1",
-]
-# Что проверять на доступ: community-1 самодостаточна; 3.1 требует ещё segmentation-3.0.
-DIAR_CHECK = [
-    "pyannote/speaker-diarization-community-1",
-    "pyannote/speaker-diarization-3.1",
-    "pyannote/segmentation-3.0",
-]
-
-
-def load_config() -> dict:
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def save_config(cfg: dict) -> None:
-    try:
-        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
-def parse_ts(text: str) -> float:
-    try:
-        parts = [float(p) for p in text.split(":")]
-    except ValueError:
-        return 0.0
-    if len(parts) == 3:
-        return parts[0] * 3600 + parts[1] * 60 + parts[2]
-    if len(parts) == 2:
-        return parts[0] * 60 + parts[1]
-    return parts[0]
-
-
-def ffprobe_duration(path) -> float:
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-            capture_output=True, text=True)
-        return float(out.stdout.strip())
-    except Exception:
-        return 0.0
-
-
-def _clock(seconds: float, srt: bool = False) -> str:
-    ms = int(round(seconds * 1000))
-    h, ms = divmod(ms, 3600000)
-    m, ms = divmod(ms, 60000)
-    s, ms = divmod(ms, 1000)
-    if srt:
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-
-
-def group_paragraphs(segments, gap=1.2, max_chars=380):
-    paras, buf, start, prev_end = [], [], None, None
-    for seg in segments:
-        text = seg["text"].strip()
-        if not text:
-            continue
-        if start is None:
-            start = seg["start"]
-        big_pause = prev_end is not None and (seg["start"] - prev_end) > gap
-        cur = " ".join(buf)
-        long_enough = len(cur) > max_chars and cur.rstrip().endswith((".", "!", "?", "…"))
-        if buf and (big_pause or long_enough):
-            paras.append((start, " ".join(buf).strip()))
-            buf, start = [], seg["start"]
-        buf.append(text)
-        prev_end = seg["end"]
-    if buf:
-        paras.append((start, " ".join(buf).strip()))
-    return paras
-
-
-def group_by_speaker(segments, gap=1.2, max_chars=380):
-    """Блоки (start, speaker, text): новый блок при смене говорящего,
-    большой паузе или когда абзац стал длинным."""
-    blocks, buf, start, cur, prev_end = [], [], None, None, None
-    for seg in segments:
-        text = seg["text"].strip()
-        if not text:
-            continue
-        spk = seg.get("speaker", "Спикер ?")
-        if cur is None:
-            cur, start = spk, seg["start"]
-        speaker_changed = spk != cur
-        big_pause = prev_end is not None and (seg["start"] - prev_end) > gap
-        cur_text = " ".join(buf)
-        long_enough = len(cur_text) > max_chars and cur_text.rstrip().endswith((".", "!", "?", "…"))
-        if buf and (speaker_changed or big_pause or long_enough):
-            blocks.append((start, cur, " ".join(buf).strip()))
-            buf, start, cur = [], seg["start"], spk
-        buf.append(text)
-        prev_end = seg["end"]
-    if buf:
-        blocks.append((start, cur, " ".join(buf).strip()))
-    return blocks
-
-
-# Запись - во временный файл рядом и затем os.replace: результат перезаписывается
-# даже если старый файл открыт, а при сбое старый файл не теряется.
-def _tmp_for(path):
-    return path.with_name("." + path.name + ".tmp")
-
-
-def write_txt(segments, path, with_ts, diarized):
-    lines = []
-    if diarized:
-        prev_spk = None
-        for start, spk, text in group_by_speaker(segments):
-            ts = f"[{_clock(start)}] " if with_ts else ""
-            if spk != prev_spk:
-                lines.append(f"{ts}{spk}: {text}")
-            else:
-                lines.append(f"{ts}{text}")
-            lines.append("")
-            prev_spk = spk
-    else:
-        for start, text in group_paragraphs(segments):
-            p = f"[{_clock(start)}] " if with_ts else ""
-            lines.append(f"{p}{text}"); lines.append("")
-    tmp = _tmp_for(path)
-    tmp.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def write_srt(segments, path, diarized):
-    blocks = []
-    for i, seg in enumerate(segments, 1):
-        text = seg["text"].strip()
-        if diarized and seg.get("speaker"):
-            text = f"{seg['speaker']}: {text}"
-        blocks.append(str(i))
-        blocks.append(f"{_clock(seg['start'], True)} --> {_clock(seg['end'], True)}")
-        blocks.append(text); blocks.append("")
-    tmp = _tmp_for(path)
-    tmp.write_text("\n".join(blocks), encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def write_docx(segments, path, title, with_ts, diarized):
-    from docx import Document
-    from docx.shared import RGBColor
-    doc = Document()
-    doc.add_heading(title, level=1)
-    if diarized:
-        prev_spk = None
-        for start, spk, text in group_by_speaker(segments):
-            p = doc.add_paragraph()
-            if with_ts:
-                ts = p.add_run(f"[{_clock(start)}] "); ts.italic = True
-                ts.font.color.rgb = RGBColor(0x5f, 0x6b, 0x7a)
-            if spk != prev_spk:
-                r = p.add_run(f"{spk}: "); r.bold = True
-                r.font.color.rgb = RGBColor(0x1f, 0x38, 0x64)
-            p.add_run(text)
-            prev_spk = spk
-    else:
-        for start, text in group_paragraphs(segments):
-            p = doc.add_paragraph()
-            if with_ts:
-                t = p.add_run(f"[{_clock(start)}] "); t.italic = True
-                t.font.color.rgb = RGBColor(0x5f, 0x6b, 0x7a)
-            p.add_run(text)
-    tmp = _tmp_for(path)
-    doc.save(str(tmp))
-    os.replace(tmp, path)
-
-
-# ---------------------------------------------------------------------------
-# Звук: один проход ffmpeg в память (и нормализация громкости в том же проходе).
-SR_FAST = 16000
-
-
-def _decode_to_array(path, normalize=True, cancel=None):
-    """ОДИН проход ffmpeg -> float32 моно 16 кГц в память. loudnorm вшит сюда же,
-    так что отдельного прохода нормализации не нужно. Читаем по кускам, чтобы
-    «Остановить» прерывал и долгую подготовку звука."""
-    import numpy as np
-    import tempfile
-    cmd = ["ffmpeg", "-nostdin", "-i", str(path)]
-    if normalize:
-        cmd += ["-af", "loudnorm"]
-    cmd += ["-ar", str(SR_FAST), "-ac", "1", "-f", "f32le", "-acodec", "pcm_f32le",
-            "-hide_banner", "-loglevel", "error", "-"]
-    with tempfile.TemporaryFile() as err:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
-        chunks = []
-        while True:
-            if cancel is not None and cancel():
-                proc.kill()
-                proc.wait()
-                raise Cancelled()
-            buf = proc.stdout.read(1 << 20)
-            if not buf:
-                break
-            chunks.append(buf)
-        proc.wait()
-        if proc.returncode != 0:
-            err.seek(0)
-            raise RuntimeError("ffmpeg: " + err.read().decode("utf-8", "ignore")[-300:])
-    return np.frombuffer(b"".join(chunks), dtype=np.float32).copy()
-
-
-class _ProgressCatcher(io.TextIOBase):
-    """Ловит строки «[00:12.000 --> 00:15.000] текст», которые mlx_whisper печатает
-    при verbose=True, и превращает их в прогресс. Заодно - точка отмены: если
-    нажали «Остановить», исключение из print прерывает распознавание сразу."""
-
-    def __init__(self, duration, cb, cancel=lambda: False):
-        self.duration = duration or 0
-        self.cb = cb
-        self.cancel = cancel
-        self.buf = ""
-
-    def write(self, s):
-        if self.cancel():
-            raise Cancelled()
-        self.buf += s
-        if "\n" in self.buf:
-            *lines, self.buf = self.buf.split("\n")
-            for line in lines:
-                m = re.search(r'-->\s*([\d:.]+)\s*\]', line)
-                if m and self.duration > 0:
-                    self.cb(min(1.0, parse_ts(m.group(1)) / self.duration))
-        return len(s)
-
-
-def _transcribe_array(mlx_whisper, audio, model_repo, lang, prog, cancel, initial_prompt=None, temperature=0.0):
-    """Один вызов mlx_whisper по массиву в памяти, с прогрессом и отменой."""
-    catcher = _ProgressCatcher(len(audio) / SR_FAST, prog, cancel)
-    with contextlib.redirect_stdout(catcher):
-        res = mlx_whisper.transcribe(
-            audio, path_or_hf_repo=model_repo, language=lang, initial_prompt=initial_prompt,
-            temperature=temperature, condition_on_previous_text=False, verbose=True)
-    return res.get("segments", [])
-
-
-def transcribe_auto(audio, model_repo, mlx_whisper, prog, cancel, stage=None, forced=None, on_mixed=None):
-    """«Авто» (2.3): сначала дешёвая проверка языков по всем фразам (multilang.probe_languages:
-    сито whisper-base + перепроверка turbo).
-    В записи есть и русский, и английский - обрабатываем как «Несколько»; иначе - один язык,
-    найденный проверкой (а не только по первым 30 с, как решал бы сам Whisper).
-    forced - язык, выбранный вручную: режим не меняем, только сообщаем о другом языке.
-    -> (segments, info)"""
-    import multilang
-    stage = stage or (lambda k, d="": None)
-    probe = multilang.probe_languages(audio, model_repo, cancel)
-    info = dict(probe=probe)
-    if forced:
-        other = {"ru": "en", "en": "ru"}[forced]
-        if probe["dominant"] == other or multilang.has_language(probe, other):
-            info["forced_other"] = other
-        lang = forced
-    elif probe["mixed"]:
-        if on_mixed:
-            on_mixed(probe)
-        info["mode"] = "mixed"
-        segs = transcribe_multilang_fast(audio, model_repo, mlx_whisper, prog, lambda m: None, cancel, stage=stage)
-        return segs, info
-    else:
-        # язык, найденный проверкой по всей записи (а не только по первым 30 с, как решил бы
-        # сам Whisper) - если проверка в нём уверена
-        lang = probe["dominant"] if probe["dominant_share"] >= 0.8 and probe["phrases"] >= 3 else None
-    info.update(mode="single", lang=lang)
-    stage("asr")
-    prog(0)
-    return _transcribe_array(mlx_whisper, audio, model_repo, lang, prog, cancel), info
-
-
-def transcribe_multilang_fast(audio, model_repo, mlx_whisper, prog, stat, cancel, stage=None, stats=None):
-    """Режим «Несколько»: язык - для каждой фразы (см. multilang.py)."""
-    import multilang
-
-    def block(clip, lang, prompt, bprog, temperature=0.0):
-        return _transcribe_array(mlx_whisper, clip, model_repo, lang, bprog, cancel, initial_prompt=prompt,
-                                 temperature=temperature)
-
-    return multilang.transcribe(audio, model_repo, block, prog, cancel,
-                                stage=stage or (lambda k, d="": None), stats=stats)
-
-
-# ---------------------------------------------------------------------------
-_PIPELINES = {}   # модель диаризации грузится один раз на запуск приложения
-
-
-def _load_pipeline(token):
-    """Загружает pyannote pipeline независимо от версии: логинимся заранее,
-    токен подхватывается из кэша/окружения, а не через параметр (у разных
-    версий pyannote параметр называется по-разному: token / use_auth_token)."""
-    if token in _PIPELINES:
-        return _PIPELINES[token]
-    os.environ["HF_TOKEN"] = token
-    os.environ["HUGGING_FACE_HUB_TOKEN"] = token
-    try:
-        from huggingface_hub import login
-        login(token=token, add_to_git_credential=False)
-    except Exception:
-        pass
-    from pyannote.audio import Pipeline
-    errors = []
-    for model in DIAR_MODELS:
-        for kw in ({}, {"token": token}):
-            try:
-                pl = Pipeline.from_pretrained(model, **kw)
-                if pl is not None:
-                    _PIPELINES[token] = pl
-                    return pl
-            except Exception as e:
-                errors.append(f"{model}: {e}")
-    raise RuntimeError(
-        "Ни одна модель диаризации не загрузилась. Обычно причина - не приняты "
-        "условия модели на Hugging Face. Откройте и нажмите Agree / Accept на:\n"
-        "huggingface.co/pyannote/speaker-diarization-community-1\n\n"
-        + "\n".join(errors[:4]))
-
-
-def _mk_hook(prog, stat, cancel):
-    """Колбэк прогресса pyannote: шаги диаризации - в шкалу и строку этапа (по-русски),
-    заодно точка отмены."""
-    last = [None]
-
-    def hook(step_name, step_artifact=None, file=None, total=None, completed=None):
-        if cancel():
-            raise Cancelled()
-        try:
-            if step_name and step_name != last[0]:
-                last[0] = step_name
-                stat(DIAR_STEPS.get(step_name, "обработка"))
-            if total and completed is not None and float(total) > 0:
-                prog(min(1.0, float(completed) / float(total)))
-        except Exception:
-            pass
-    return hook
-
-
-def _extract_turns(diar):
-    """Достаёт (start, end, speaker) из результата любой версии pyannote."""
-    ann = getattr(diar, "speaker_diarization", diar)
-    turns = []
-    if hasattr(ann, "itertracks"):
-        for item in ann.itertracks(yield_label=True):
-            seg, spk = item[0], item[-1]
-            turns.append((seg.start, seg.end, spk))
-    else:
-        for turn, spk in ann:
-            turns.append((turn.start, turn.end, spk))
-    return turns
-
-
-def diarize_and_label(audio_path, segments, token, num_speakers, log, prog, cancel=lambda: False):
-    import torch
-    log("загрузка модели")
-    pipeline = _load_pipeline(token)
-    device = "cpu"
-    try:
-        if torch.backends.mps.is_available():
-            pipeline.to(torch.device("mps")); device = "mps"
-    except Exception:
-        device = "cpu"
-    # Готовим аудио сами через ffmpeg и подаём waveform напрямую - минуя torchcodec,
-    # который ломается на свежих связках PyTorch/ffmpeg. Без нормализации - как раньше.
-    data = _decode_to_array(audio_path, normalize=False)
-    waveform = torch.from_numpy(data).unsqueeze(0)  # (1, N)
-    payload = {"waveform": waveform, "sample_rate": SR_FAST}
-    kwargs = {"num_speakers": num_speakers} if num_speakers and num_speakers > 0 else {}
-    hook = _mk_hook(prog, log, cancel)
-
-    def _run(pl):
-        try:
-            return pl(payload, hook=hook, **kwargs)
-        except TypeError:
-            return pl(payload, **kwargs)  # старые версии без hook
-
-    try:
-        diar = _run(pipeline)
-    except Cancelled:
-        raise
-    except Exception:
-        if device != "mps":
-            raise
-        log("повтор на процессоре")
-        pipeline.to(torch.device("cpu"))
-        diar = _run(pipeline)
-    turns = _extract_turns(diar)
-    mapping, n = {}, 0
-    for _, _, spk in turns:
-        if spk not in mapping:
-            n += 1; mapping[spk] = f"Спикер {n}"
-
-    def speaker_at(a, b):
-        best, best_ov = None, 0.0
-        for s, e, spk in turns:
-            ov = max(0.0, min(b, e) - max(a, s))
-            if ov > best_ov:
-                best_ov, best = ov, spk
-        return mapping.get(best, "Спикер ?")
-
-    for seg in segments:
-        seg["speaker"] = speaker_at(seg["start"], seg["end"])
-    return segments
-
-
-def free_asr_models():
-    """Перед итогами выгружаем Whisper и pyannote: qwen3.5:9b занимает ~6 ГБ, и вместе
-    с ними (и с работающим LKD) Mac на 16 ГБ начинает задыхаться."""
-    import gc
-    try:
-        from mlx_whisper.transcribe import ModelHolder
-        ModelHolder.model = None
-        ModelHolder.model_path = None
-    except Exception:
-        pass
-    _PIPELINES.clear()
-    try:
-        import multilang
-        multilang._LID.clear()
-    except Exception:
-        pass
-    gc.collect()
-    try:
-        import mlx.core as mx
-        mx.clear_cache()
-    except Exception:
-        pass
-    try:
-        import torch
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-    except Exception:
-        pass
-
-
-def read_transcript(path):
-    """Текст готовой расшифровки (.txt / .docx / .srt) - для итогов по файлам из прошлых запусков."""
-    path = Path(path)
-    if path.suffix.lower() == ".docx":
-        from docx import Document
-        paras = [p.text for p in Document(str(path)).paragraphs]
-        if paras and paras[0].strip() == path.stem:      # заголовок, который пишет сам Scribe
-            paras = paras[1:]
-        return "\n".join(t for t in paras if t.strip())
-    text = path.read_text(encoding="utf-8", errors="replace")
-    if path.suffix.lower() == ".srt":
-        keep = [ln for ln in text.splitlines()
-                if ln.strip() and not ln.strip().isdigit() and "-->" not in ln]
-        return " ".join(keep)
-    return text
-
-
-def ollama_installed():
-    import shutil
-    return os.path.isdir("/Applications/Ollama.app") or bool(shutil.which("ollama"))
-
-
-def _fmt_dur(sec):
-    if not sec:
-        return ""
-    m, s = divmod(int(sec), 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-def _fmt_size(n):
-    for unit in ("Б", "КБ", "МБ", "ГБ"):
-        if n < 1024 or unit == "ГБ":
-            return f"{n:.0f} {unit}" if unit in ("Б", "КБ") else f"{n:.1f} {unit}".replace(".", ",")
-        n /= 1024
-
-
-def _short(name, n=58):
-    return name if len(name) <= n else name[:n - 12] + "…" + name[-11:]
-
+# Ядро без окна - core.py (его же использует консольный scribe_cli.py)
+from core import (  # noqa: F401 - всё ядро доступно и как whisper_gui.<имя>
+    MODEL_REPO, MODELS, LANG_SEG, LANG_CODE, LANG_HINT, LANG_NAME,
+    FMT_SEG, TEXT_EXTS, NSPK, _model_title, _models_base, _models_dir_path,
+    _models_dir_display, _apply_models_dir, AUDIO_EXTS, AUDIO_TYPES, STEP_NAMES, STEP_CHIP,
+    DIAR_STEPS, FORMATS_AUDIO, FORMATS_VIDEO, APP_VERSION, CONFIG_PATH, DIAR_MODELS,
+    DIAR_CHECK, load_config, save_config, ffprobe_duration, _clock, group_paragraphs,
+    group_by_speaker, _tmp_for, write_txt, write_srt, write_docx, SR_FAST,
+    _decode_to_array, _transcribe_array, transcribe_auto, transcribe_multilang_fast, _PIPELINES, _load_pipeline,
+    _mk_hook, _extract_turns, diarize_and_label, free_asr_models, read_transcript, ollama_installed,
+    _fmt_dur, _fmt_size, _short)
 
 # ---------------------------------------------------------------------------
 # Интерфейс
@@ -691,8 +148,10 @@ class FileRow(ctk.CTkFrame):
 
     def refresh(self):
         j = self.job
+        est = self.app.estimate(j.duration) if j.kind == "audio" and j.state == "queue" else None
         meta = [x for x in ("готовая расшифровка" if j.kind == "text" else "", _fmt_dur(j.duration),
-                            _fmt_size(j.size) if j.size else "", j.path.parent.name) if x]
+                            _fmt_size(j.size) if j.size else "", j.path.parent.name,
+                            (f"≈ {max(10, round(est / 10) * 10)} с" if est < 90 else f"≈ {round(est / 60)} мин") + " на этом компьютере" if est else "") if x]
         self.meta.configure(text="  ·  ".join(meta))
         kind, text = {"queue": ("neutral", "В очереди"), "run": ("acc", j.stage or "Идёт…"),
                       "done": ("ok", "Готово"), "error": ("bad", "Ошибка"),
@@ -712,11 +171,11 @@ class FileRow(ctk.CTkFrame):
                 b = T.button(self.acts, "Подвести итоги", "sparkles", kind="ghost", height=28, size=13, width=140,
                              command=lambda: self.app.summarize_job(j))
                 b.configure(border_width=1, border_color=T.BORDER_STRONG)
-                if self.app.running or not ollama_installed():
+                if self.app.running:
                     b.configure(state="disabled")
                 b.pack(side="left", padx=2)
             T.button(self.acts, "", "folder-open", kind="ghost", height=28,
-                     command=lambda: subprocess.run(["open", "-R", str(j.out)], check=False)
+                     command=lambda: pu.reveal(j.out)
                      ).pack(side="left", padx=2)
         else:
             self.acts.grid_remove()
@@ -734,7 +193,7 @@ class FileRow(ctk.CTkFrame):
 
 
 def _open(path):
-    subprocess.run(["open", str(path)], check=False)
+    pu.open_path(path)
 
 
 def _first_line(e, n=220):
@@ -742,10 +201,111 @@ def _first_line(e, n=220):
     return s if len(s) <= n else s[:n] + "…"
 
 
+class ModelsWindow(ctk.CTkToplevel):
+    """«Загрузка моделей»: что нужно, сколько весит, скачивание с прогрессом,
+    или офлайн-пакет из папки - без интернета."""
+
+    def __init__(self, master, app, items):
+        super().__init__(master)
+        self.app, self.items = app, items
+        self.title("Загрузка моделей")
+        self.geometry("620x400")
+        self.transient(master)
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=22, pady=18)
+        T.label(wrap, "Модели для распознавания", 18, bold=True, anchor="w").pack(fill="x")
+        T.label(wrap, "Скачиваются один раз, дальше Scribe работает без интернета. Если интернета нет - "
+                      "выберите папку офлайн-пакета моделей.", 13, color=T.MUTED, anchor="w", justify="left",
+                wraplength=570).pack(fill="x", pady=(4, 12))
+        self.rows = {}
+        for it in items:
+            r = ctk.CTkFrame(wrap, fg_color="transparent"); r.pack(fill="x", pady=2)
+            T.label(r, it["title"], 13, anchor="w").pack(side="left")
+            st = T.label(r, "", 12, color=T.MUTED, anchor="e"); st.pack(side="right")
+            self.rows[it["repo"]] = st
+        self.bar = ctk.CTkProgressBar(wrap, height=6); self.bar.set(0)
+        self.bar.pack(fill="x", pady=(14, 4))
+        self.note = T.label(wrap, "", 12, color=T.MUTED, anchor="w", justify="left", wraplength=570)
+        self.note.pack(fill="x")
+        btns = ctk.CTkFrame(wrap, fg_color="transparent"); btns.pack(side="bottom", fill="x", pady=(10, 0))
+        self.dl_btn = T.button(btns, "Скачать", "upload", kind="primary", width=160, command=self._download)
+        self.dl_btn.pack(side="left")
+        T.button(btns, "Загрузить из папки…", "folder-open", width=200, command=self._from_folder).pack(side="left", padx=8)
+        T.button(btns, "Позже", kind="ghost", width=90, command=self.destroy).pack(side="right")
+        self._show()
+
+    def _need(self):
+        tok = self.app.cfg.get("hf_token")
+        return [it for it in self.items if not it["local"] and (not it["optional"] or tok)]
+
+    def _show(self):
+        tok = self.app.cfg.get("hf_token")
+        for it in self.items:
+            if it["local"]:
+                txt, col = "есть", T.OK
+            elif it["optional"] and not tok:
+                txt, col = "нужен токен HF или офлайн-пакет", T.WARN
+            else:
+                txt, col = f"≈ {_mb(it['mb'])}", T.MUTED
+            self.rows[it["repo"]].configure(text=txt, text_color=col)
+        need = self._need()
+        mb = sum(it["mb"] for it in need)
+        self.dl_btn.configure(text=f"Скачать ≈ {_mb(mb)}" if need else "Всё на месте",
+                              state="normal" if need else "disabled")
+        if not need:
+            self.bar.set(1)
+
+    def _download(self):
+        import models
+        self.dl = models.Downloader(self._need(), self.app.cfg.get("hf_token"))
+        if not self.dl.items:
+            return
+        self.dl_btn.configure(state="disabled", text="Скачиваю…")
+        self.dl.start()
+        self.after(500, self._poll)
+
+    def _poll(self):
+        got, total = self.dl.progress()
+        self.bar.set(min(1.0, got / total) if total else 0)
+        cur = self.dl.current["title"] if self.dl.current else ""
+        self.note.configure(text=f"{_mb(got / 1048576)} из {_mb(total / 1048576)} · {cur}", text_color=T.MUTED)
+        if not self.dl.done:
+            self.after(500, self._poll)
+            return
+        if self.dl.error:
+            self.note.configure(text=f"Не удалось скачать: {_first_line(self.dl.error)}. Нет интернета? "
+                                     "Можно выбрать офлайн-пакет моделей.", text_color=T.BAD)
+        else:
+            self.note.configure(text="Готово - модели на месте.", text_color=T.OK)
+        self._show()
+
+    def _from_folder(self):
+        import models
+        d = filedialog.askdirectory(title="Папка офлайн-пакета моделей", parent=self)
+        if not d:
+            return
+        home, msg = models.use_folder(d)
+        if not home:
+            self.note.configure(text=msg, text_color=T.WARN)
+            return
+        self.app.cfg["models_dir"] = home
+        save_config(self.app.cfg)
+        for it in self.items:
+            it["local"] = models.is_local(it["repo"])
+        self.note.configure(text=msg, text_color=T.OK)
+        self._show()
+        self.app.after_models_changed()
+
+
+def _mb(mb):
+    return f"{mb / 1024:.1f} ГБ".replace(".", ",") if mb >= 1024 else f"{mb:.0f} МБ"
+
+
 class App:
     def __init__(self, root, cfg):
         self.root = root
         self.cfg = cfg
+        self.eng = None                 # движок распознавания - узнаём в фоне (импорт MLX/CTranslate2 небыстрый)
         self.jobs = []
         self.q = queue.Queue()
         self.running = False
@@ -789,6 +349,7 @@ class App:
         self.root.after(120, self._drain)
         self.root.after(500, self._tick)
         self.root.after(600, self._prebuild_dict)
+        threading.Thread(target=self._probe_engine, daemon=True).start()
         self._check_ollama()
 
     # ================= боковое меню =================
@@ -813,8 +374,9 @@ class App:
         self.theme_btn.configure(command=self._cycle_theme)
         self.theme_btn.pack(fill="x", pady=1)
         self._theme_label()
-        T.label(bottom, f"Scribe {APP_VERSION}\nлокально на Apple MLX", 11, color=T.FAINT,
-                anchor="w", justify="left", wraplength=180).pack(fill="x", padx=10, pady=(8, 0))
+        self.ver_lbl = T.label(bottom, f"Scribe {APP_VERSION}\nлокально", 11, color=T.FAINT,
+                               anchor="w", justify="left", wraplength=180)
+        self.ver_lbl.pack(fill="x", padx=10, pady=(8, 0))
 
     def _nav_btn(self, parent, text, ic, key):
         b = ctk.CTkButton(parent, text=text, anchor="w", height=36, corner_radius=8, border_width=0,
@@ -848,12 +410,90 @@ class App:
         if key == "dict":
             self.dict_page.activate()
 
+    def _probe_engine(self):
+        try:
+            import engine
+            eng = engine.get_engine()
+            import models
+            items = models.needed(self.cfg, eng)
+            self.q.put(("engine", (eng, items)))
+        except Exception as e:
+            self.q.put(("engine", (None, str(e))))
+
+    def _engine_ready(self, eng, items):
+        self.eng = eng
+        if eng is None:
+            self.engine_lbl.configure(text=f"Распознавание недоступно: {_first_line(items)}", text_color=T.BAD)
+            return
+        self.engine_lbl.configure(text=f"Распознавание: {eng.label}", text_color=T.TEXT)
+        short = {"mlx": "на Apple MLX", "cuda": "на видеокарте NVIDIA", "cpu": "на процессоре"}
+        self.ver_lbl.configure(text=f"Scribe {APP_VERSION}\nлокально {short.get(getattr(eng, 'device', ''), '')}".rstrip())
+        cpu = getattr(eng, "device", "") == "cpu"
+        if cpu:
+            self.cpu_box.pack(fill="x", pady=(14, 0), after=self.model_hint)
+        if pu.IS_WIN and cpu and pu.has_nvidia():
+            self.nv_box.pack(fill="x", pady=(10, 0), after=self.cpu_box)
+        self._sync_opts()
+        self._dict_auto()
+        for j in self.jobs:
+            j.row.refresh()
+        if any(not it["local"] and not it["optional"] for it in items):
+            self.open_models(items)
+
+    def open_models(self, items=None):
+        if self.eng is None:
+            return
+        import models
+        items = items or models.needed(self.cfg, self.eng)
+        if getattr(self, "_models_win", None) is not None and self._models_win.winfo_exists():
+            self._models_win.focus(); return
+        self._models_win = ModelsWindow(self.root, self, items)
+
+    def after_models_changed(self):
+        self._sync_opts()
+
+    def _pyannote_local(self):
+        if not hasattr(self, "_pyl"):
+            import models
+            self._pyl = models.is_local(models.PYANNOTE)
+        return self._pyl
+
+    def _diar_ready(self):
+        return bool(self.cfg.get("hf_token")) or self._pyannote_local()
+
+    # --- оценка времени по замерам на этой машине ---
+    def _speed_key(self, mode, diar):
+        eng = self.eng
+        dev = f"{eng.name}:{getattr(eng, 'device', '')}" if eng else "?"
+        return f"{dev}|{mode}|{'diar' if diar else '-'}"
+
+    def _remember_speed(self, mode, diar, seconds, duration):
+        if duration < 20:
+            return
+        sp = self.cfg.setdefault("speed", {})
+        k = self._speed_key(mode, diar)
+        r = seconds / duration
+        sp[k] = round(r if k not in sp else 0.6 * sp[k] + 0.4 * r, 4)
+        save_config(self.cfg)
+
+    def estimate(self, duration):
+        """Сколько займёт файл - по прошлым расшифровкам на ЭТОЙ машине (а не по цифрам с Mac)."""
+        if not duration or self.eng is None:
+            return None
+        mode = "mixed" if self.lang_seg.get() == "Несколько" else "single"
+        r = self.cfg.get("speed", {}).get(self._speed_key(mode, self.diar_var.get()))
+        return r * duration if r else None
+
     def _prebuild_dict(self):
         """Страницу «Диктофон» строим заранее (без запуска распознавания): тяжёлое
         построение в момент щелчка по меню задерживало перерисовку."""
         if self.dict_page is None:
             from dictaphone import DictaphonePage
-            self.dict_page = DictaphonePage(self.content, self.cfg.get("model_repo", MODEL_REPO), self.cfg)
+            model = self.cfg.get("dict_model") or self.cfg.get("model_repo", MODEL_REPO)
+            self.dict_page = DictaphonePage(self.content, model, self.cfg)
+            self.dict_page.on_model_switch = self._dict_switched
+            self.dict_page.small_ok = self._small_ok
+            self._dict_auto()
             self.pages["dict"] = self.dict_page
 
     def _theme_label(self):
@@ -878,7 +518,7 @@ class App:
         head = ctk.CTkFrame(page, fg_color="transparent")
         head.grid(row=0, column=0, columnspan=2, sticky="ew", padx=28, pady=(22, 14))
         T.label(head, "Расшифровка", 22, bold=True, anchor="w").pack(fill="x")
-        T.label(head, "Аудио и видео → текст. Всё распознаётся на этом Mac; результат сохраняется "
+        T.label(head, f"Аудио и видео → текст. Всё распознаётся {pu.HERE}; результат сохраняется "
                       "рядом с исходным файлом.", 13, color=T.MUTED, anchor="w").pack(fill="x", pady=(2, 0))
 
         # --- слева: файлы ---
@@ -980,8 +620,9 @@ class App:
         self.nspk_var = ctk.StringVar(value=cfg.get("nspk", "Авто") if cfg.get("nspk") in NSPK else "Авто")
         ctk.CTkOptionMenu(self.nspk_row, variable=self.nspk_var, values=list(NSPK), width=90, height=28,
                           font=T.font(13), dropdown_font=T.font(13)).pack(side="left", padx=(10, 0))
-        self.token_link = T.label(o, "Нужен токен Hugging Face - задать в Настройках", 12, color=T.ACCENT,
-                                  anchor="w", justify="left", wraplength=250, cursor="pointinghand")
+        self.token_link = T.label(o, "Нужен токен Hugging Face или офлайн-пакет моделей - Настройки", 12,
+                                  color=T.ACCENT,
+                                  anchor="w", justify="left", wraplength=250, cursor=pu.HAND)
         self.token_link.bind("<Button-1>", lambda e: self.show("settings"))
         self.diar_hint = T.label(o, "Метки «Спикер 1, 2…». Заметно дольше.", 12, color=T.MUTED, anchor="w",
                                  justify="left", wraplength=250)
@@ -997,6 +638,7 @@ class App:
         self.sum_cb.pack(anchor="w", pady=(12, 0))
         self.sum_hint = T.label(o, "", 12, color=T.MUTED, anchor="w", justify="left", wraplength=250)
         self.sum_hint.pack(fill="x", padx=(30, 0), pady=(2, 0))
+        self.sum_hint.bind("<Button-1>", lambda e: None if ollama_installed() else self.explain_ollama())
         self._sync_opts()
 
     def _lang_hint(self):
@@ -1007,12 +649,17 @@ class App:
     def _sync_opts(self):
         """Согласовать опции между собой: без токена говорящих не включить,
         для субтитров таймкоды и так есть, без Ollama нет итогов."""
-        has_token = bool(self.cfg.get("hf_token"))
+        has_token = self._diar_ready()     # токен Hugging Face или модель из офлайн-пакета
         if not has_token:
             self.diar_var.set(False)
         self.diar_cb.configure(state="normal" if has_token else "disabled")
         for w in (self.nspk_row, self.token_link, self.diar_hint):
             w.pack_forget()
+        cpu = self.eng is not None and getattr(self.eng, "device", "") == "cpu"
+        self.diar_hint.configure(
+            text="Метки «Спикер 1, 2…». Заметно дольше." + (
+                " На процессоре - намного дольше: часовая запись может идти десятки минут." if cpu else ""),
+            text_color=T.WARN if cpu else T.MUTED)
         if not has_token:
             self.token_link.pack(fill="x", padx=(30, 0), pady=(2, 0), after=self.diar_cb)
         elif self.diar_var.get():
@@ -1029,8 +676,8 @@ class App:
         else:
             self.sum_var.set(False)
             self.sum_cb.configure(state="disabled")
-            self.sum_hint.configure(text="Нужна Ollama (ollama.com) - локальная модель для текста.",
-                                    text_color=T.WARN)
+            self.sum_hint.configure(text="Нужна Ollama - бесплатная программа для локальной модели. "
+                                         "Как поставить - нажмите здесь.", text_color=T.WARN)
 
     # ---------- файлы ----------
     def _refresh_files(self):
@@ -1180,6 +827,8 @@ class App:
                         job.row.refresh()
                 elif kind == "token":
                     self._token_result(*msg[1])
+                elif kind == "engine":
+                    self._engine_ready(*msg[1])
                 elif kind == "ollama":
                     self._ollama_result(*msg[1])
                 elif kind == "done":
@@ -1214,7 +863,7 @@ class App:
             lang=LANG_CODE.get(sel), multilang=(sel == "Несколько"),
             model=self.cfg.get("model_repo", MODEL_REPO), fmt=fmt,
             with_ts=self.ts_var.get() and fmt != "srt",
-            diar=self.diar_var.get() and bool(self.cfg.get("hf_token")),
+            diar=self.diar_var.get() and self._diar_ready(),
             nspk=NSPK[self.nspk_var.get()], token=self.cfg.get("hf_token", ""),
             normalize=self.cfg.get("normalize", True),
             summary=self.sum_var.get(), sum_model=self.cfg.get("summary_model", summary.DEFAULT_MODEL),
@@ -1250,9 +899,24 @@ class App:
         self.nav["files"].configure(text="Расшифровка  ·  идёт")
         self.progress.configure(mode="determinate"); self.progress.set(0)
 
+    def explain_ollama(self):
+        """Итоги делает Ollama - отдельная бесплатная программа. Если её нет - объясняем, как поставить."""
+        import webbrowser
+        if messagebox.askyesno(
+                "Итоги: нужна Ollama",
+                "Итоги готовит локальная языковая модель через бесплатную программу Ollama - "
+                "текст никуда не уходит. Остальное в Scribe работает и без неё.\n\n"
+                "Как поставить:\n1. Скачайте Ollama с ollama.com и установите.\n"
+                "2. В командной строке: ollama pull qwen3.5:4b (или qwen3.5:9b, если памяти от 16 ГБ).\n"
+                "3. Перезапустите Scribe.\n\nОткрыть ollama.com?"):
+            webbrowser.open("https://ollama.com/download")
+
     def summarize_job(self, job):
         """«Подвести итоги» у готового файла: итоги из готовой расшифровки, без повторного распознавания."""
         if self.running:
+            return
+        if not ollama_installed():
+            self.explain_ollama()
             return
         opts = dict(sum_model=self.cfg.get("summary_model", summary.DEFAULT_MODEL))
         job.state, job.warn, job.error = "run", "", ""
@@ -1283,9 +947,11 @@ class App:
         cancel = self.cancel_evt.is_set
         try:
             self._stat("Загружаю модель…")
-            import mlx_whisper
+            import engine
+            eng = engine.get_engine()
         except Exception as e:
-            self.q.put(("done", ("error", "Не найден mlx_whisper:\n  pip install mlx-whisper\n\n" + str(e)))); return
+            self.q.put(("done", ("error", "Не найден движок распознавания:\n  pip install faster-whisper\n"
+                                          "(на Mac: pip install mlx-whisper)\n\n" + str(e)))); return
         if o["fmt"] == "docx":
             try:
                 import docx  # noqa
@@ -1310,14 +976,14 @@ class App:
                 + (["sum"] if o["summary"] else [])
             stage = self._stages(job, keys, pre, o["normalize"])
             try:
-                done.append(self._run_one(job, o, mlx_whisper, stage, cancel))
+                done.append(self._run_one(job, o, eng, stage, cancel))
             except Cancelled:
                 cancelled = True
                 self._job(job, state="cancel")
             except FileNotFoundError as e:
                 if "ffmpeg" in str(e) or "ffprobe" in str(e):
                     self._job(job, state="error", error="Не найден ffmpeg")
-                    self.q.put(("done", ("error", "Не найден ffmpeg. В Терминале:\n  brew install ffmpeg"))); return
+                    self.q.put(("done", ("error", pu.FFMPEG_HINT))); return
                 failed += 1
                 self._job(job, state="error", error=_first_line(e))
             except Exception as e:
@@ -1340,7 +1006,9 @@ class App:
             msg = ("ok", f"Готово. Файлов: {len(done)}.")
         self.q.put(("done", msg))
 
-    def _run_one(self, job, o, mlx_whisper, stage, cancel):
+    def _run_one(self, job, o, eng, stage, cancel):
+        t_start = time.monotonic()
+        job_mixed = False
         path = job.path
         if not path.exists():
             raise RuntimeError("Файл не найден - его переместили или удалили.")
@@ -1362,16 +1030,18 @@ class App:
         duration = len(audio) / SR_FAST
         self._job(job, duration=duration)
         if o["multilang"]:
-            segments = transcribe_multilang_fast(audio, o["model"], mlx_whisper, self._prog, lambda m: None, cancel,
+            segments = transcribe_multilang_fast(audio, o["model"], eng, self._prog, lambda m: None, cancel,
                                                  stage=stage)
         else:
             stage("prep", "проверка языков")
 
             def on_mixed(probe):
+                nonlocal job_mixed
+                job_mixed = True
                 stage.keys.insert(stage.keys.index("asr"), "lang")    # «Авто» стал «Несколько»: +1 шаг
                 self._job(job, info="Найдены русский и английский - обработано как смешанная запись.")
 
-            segments, info = transcribe_auto(audio, o["model"], mlx_whisper, self._prog, cancel, stage=stage,
+            segments, info = transcribe_auto(audio, o["model"], eng, self._prog, cancel, stage=stage,
                                              forced=o["lang"], on_mixed=on_mixed)
             other = info.get("forced_other")
             if other:
@@ -1413,6 +1083,8 @@ class App:
             except Exception as e:
                 warn.append(f"Итоги не сделаны: {_first_line(e)}")
         self._prog(1.0)
+        self._remember_speed("mixed" if (o["multilang"] or job_mixed) else "single", diar_used,
+                             time.monotonic() - t_start, duration)
         warn = "\n".join(warn)
         self._job(job, state="done", summary=summ, warn=warn)
         return out, summ, warn
@@ -1427,7 +1099,7 @@ class App:
             raise RuntimeError("Ollama не запущена. Откройте приложение Ollama (ollama.com) и повторите.")
         model = summary.pick_model(o["sum_model"], summary.list_models())
         if not model:
-            raise RuntimeError("в Ollama нет моделей. В Терминале: ollama pull " + summary.DEFAULT_MODEL)
+            raise RuntimeError(f"в Ollama нет моделей. {pu.SHELL.capitalize()}: ollama pull " + summary.DEFAULT_MODEL)
         stage("sum")
         data = summary.summarize(text, model, self._prog, lambda m: stage("sum", m), cancel)
         src = job.path.name if job.kind == "audio" else None
@@ -1469,10 +1141,44 @@ class App:
 
         # --- Распознавание ---
         c = self._card(wrap, "Распознавание")
+        self.engine_lbl = T.label(c, "Распознавание: определяю…", 13, bold=True, color=T.MUTED, anchor="w")
+        self.engine_lbl.pack(fill="x", pady=(0, 10))
+        self.cpu_box = ctk.CTkFrame(c, fg_color="transparent")      # показывается только на процессоре
+        T.label(self.cpu_box, "Видеокарты нет - Scribe работает на процессоре: та же модель, но медленнее. "
+                              "Оценка времени в карточке файла - по прошлым расшифровкам на этом компьютере.",
+                12, color=T.MUTED, anchor="w", justify="left", wraplength=640).pack(fill="x")
+        dr = ctk.CTkFrame(self.cpu_box, fg_color="transparent"); dr.pack(fill="x", pady=(8, 0))
+        T.label(dr, "Модель для диктофона", 13, color=T.MUTED).pack(side="left")
+        dm = {"turbo": "Turbo (как для файлов)", "medium": "Medium - быстрее", "small": "Small - самая быстрая"}
+        self._dict_models = dm
+        import engine as _E
+        cur = _E.model_key(self.cfg.get("dict_model") or "turbo")
+        self.dict_model_var = ctk.StringVar(value=dm.get(cur, dm["turbo"]))
+        ctk.CTkOptionMenu(dr, variable=self.dict_model_var, values=list(dm.values()), width=240, height=30,
+                          font=T.font(13), dropdown_font=T.font(13), command=self._save_dict_model
+                          ).pack(side="left", padx=(10, 0))
+        T.label(self.cpu_box, "Если текст в диктофоне отстаёт от речи больше чем на 5 с, диктофон сам "
+                              "перейдёт на Small (быстрее, чуть менее точно). Выбор здесь отключает это; "
+                              "вступит в силу после перезапуска Scribe.", 12, color=T.MUTED,
+                anchor="w", justify="left", wraplength=640).pack(fill="x", pady=(4, 0))
+        self.nv_box = ctk.CTkFrame(c, fg_color="transparent")       # Windows + NVIDIA без библиотек CUDA
+        nr = ctk.CTkFrame(self.nv_box, fg_color="transparent"); nr.pack(fill="x")
+        self.nv_btn = T.button(nr, "Ускорение на видеокарте NVIDIA - скачать", "upload", height=30, size=13,
+                               width=330, command=self._nvidia_download)
+        self.nv_btn.pack(side="left")
+        self.nv_note = T.label(self.nv_box, "Найдена видеокарта NVIDIA. Библиотеки CUDA (≈ 1,2 ГБ) скачиваются "
+                                            "отдельно, чтобы не раздувать установщик.", 12, color=T.MUTED,
+                               anchor="w", justify="left", wraplength=640)
+        self.nv_note.pack(fill="x", pady=(4, 0))
         self.model_var = ctk.StringVar(value=_model_title(self.cfg.get("model_repo", MODEL_REPO)))
-        ctk.CTkOptionMenu(c, variable=self.model_var, values=list(MODELS), width=380, height=32,
-                          font=T.font(13), dropdown_font=T.font(13), command=self._save_model).pack(anchor="w")
-        self._hint(c, "Turbo - быстрая и рекомендуемая. Large v3 в разы медленнее при том же результате.")
+        mrow = ctk.CTkFrame(c, fg_color="transparent"); mrow.pack(fill="x")
+        T.label(mrow, "Модель", 13, color=T.MUTED).pack(side="left")
+        ctk.CTkOptionMenu(mrow, variable=self.model_var, values=list(MODELS), width=380, height=32,
+                          font=T.font(13), dropdown_font=T.font(13), command=self._save_model
+                          ).pack(side="left", padx=(10, 0))
+        self.model_hint = T.label(c, "Turbo - быстрая и рекомендуемая. Large v3 в разы медленнее при том же "
+                                     "результате.", 12, color=T.MUTED, anchor="w", justify="left", wraplength=640)
+        self.model_hint.pack(fill="x", pady=(4, 0))
         self.norm_var = ctk.BooleanVar(value=self.cfg.get("normalize", True))
         ctk.CTkCheckBox(c, text="Нормализовать громкость", variable=self.norm_var, font=T.font(14),
                         checkbox_width=20, checkbox_height=20, command=self._save_norm).pack(anchor="w", pady=(14, 0))
@@ -1494,10 +1200,10 @@ class App:
         self.sum_model_menu.pack(side="left", padx=(10, 0))
         self._hint(c, "Документ «<имя> - итоги» кладётся рядом с полной расшифровкой: суть, главное, "
                       "решения, задачи, открытые вопросы. Делается, когда отмечено «Итоги», или кнопкой "
-                      "«Подвести итоги» у готового файла. Модель работает на этом Mac через Ollama - "
+                      f"«Подвести итоги» у готового файла. Модель работает {pu.HERE} через Ollama - "
                       "текст никуда не уходит.")
         self._hint(c, "Память: на время итогов Scribe выгружает модели распознавания, а Ollama освобождает "
-                      "память сразу после итогов. На Mac с 16 ГБ при работающем LKD лучше qwen3.5:4b.")
+                      "память сразу после итогов. При 16 ГБ памяти и других тяжёлых программах лучше qwen3.5:4b.")
 
         # --- Говорящие ---
         c = self._card(wrap, "Определение говорящих")
@@ -1528,6 +1234,13 @@ class App:
         T.button(mr, "Открыть", "folder-open", height=30, size=13, width=100,
                  command=self._open_models).pack(side="right", padx=6)
         self._hint(c, "Сюда скачиваются модели распознавания (~1,5 ГБ). Можно открыть папку и удалить ненужное.")
+        mb = ctk.CTkFrame(c, fg_color="transparent"); mb.pack(fill="x", pady=(10, 0))
+        T.button(mb, "Скачать модели…", "upload", height=30, size=13, width=170,
+                 command=lambda: self.open_models()).pack(side="left")
+        T.button(mb, "Загрузить модели из папки…", "folder-open", height=30, size=13, width=250,
+                 command=self._models_from_folder).pack(side="left", padx=8)
+        self._hint(c, "Без интернета: распакуйте офлайн-пакет моделей Scribe и выберите его папку - модели "
+                      "возьмутся оттуда, без обращения к интернету.")
 
         # --- Форматы ---
         c = self._card(wrap, "Поддерживаемые форматы")
@@ -1549,9 +1262,58 @@ class App:
 
     def _link(self, parent, text, url):
         import webbrowser
-        lb = T.label(parent, text, 12, color=T.ACCENT, anchor="w", cursor="pointinghand")
+        lb = T.label(parent, text, 12, color=T.ACCENT, anchor="w", cursor=pu.HAND)
         lb.pack(fill="x", pady=(2, 0))
         lb.bind("<Button-1>", lambda e: webbrowser.open(url))
+
+    def _save_dict_model(self, v):
+        key = {t: k for k, t in self._dict_models.items()}[v]
+        self.cfg["dict_model"] = key                 # выбран вручную - автоматика больше не трогает
+        save_config(self.cfg)
+
+    def _dict_auto(self):
+        """На процессоре, пока модель диктофона не выбрана вручную, диктофон сам перейдёт на Small,
+        если текст отстаёт больше 5 с."""
+        page = getattr(self, "dict_page", None)
+        if page is not None and self.eng is not None:
+            page.auto_small = getattr(self.eng, "device", "") == "cpu" and not self.cfg.get("dict_model")
+
+    def _small_ok(self):
+        import models
+        return self.eng is not None and (self.eng.is_local("small") or models.online())
+
+    def _dict_switched(self, key):
+        self.cfg["dict_model"] = key
+        save_config(self.cfg)
+        if hasattr(self, "dict_model_var"):
+            self.dict_model_var.set(self._dict_models[key])
+
+    def _models_from_folder(self):
+        import models
+        d = filedialog.askdirectory(title="Папка офлайн-пакета моделей")
+        if not d:
+            return
+        home, msg = models.use_folder(d)
+        if home:
+            self.cfg["models_dir"] = home
+            save_config(self.cfg)
+            self.models_dir_lbl.configure(text=_models_dir_display(self.cfg))
+            if hasattr(self, "_pyl"):
+                del self._pyl
+            self._sync_opts()
+        messagebox.showinfo("Модели", msg)
+
+    def _nvidia_download(self):
+        import models
+        self.nv_btn.configure(state="disabled", text="Скачиваю…")
+
+        def run():
+            try:
+                models.nvidia_download(lambda g, t: self.q.put(("status", f"Ускорение NVIDIA: {g / t:.0%}")))
+                self.q.put(("status", "Ускорение NVIDIA скачано - перезапустите Scribe."))
+            except Exception as e:
+                self.q.put(("status", f"Не удалось скачать ускорение NVIDIA: {_first_line(e)}"))
+        threading.Thread(target=run, daemon=True).start()
 
     def _save_model(self, _v=None):
         self.cfg["model_repo"] = MODELS[self.model_var.get()]
@@ -1569,7 +1331,7 @@ class App:
         p = _models_dir_path(self.cfg)
         try: os.makedirs(p, exist_ok=True)
         except Exception: pass
-        subprocess.run(["open", p], check=False)
+        pu.open_folder(p)
 
     def _change_models(self):
         d = filedialog.askdirectory(title="Папка для моделей")
@@ -1670,6 +1432,7 @@ class App:
 
 def main():
     cfg = load_config()
+    pu.setup_cuda()                              # библиотеки CUDA, если скачаны кнопкой «Ускорение NVIDIA»
     _apply_models_dir(cfg.get("models_dir"))
     T.apply()                                    # тему - до создания окна
     ctk.set_appearance_mode(cfg.get("theme", "system"))

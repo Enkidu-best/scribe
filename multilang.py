@@ -6,8 +6,9 @@
   1. Фразы - Silero VAD (vad.py): речь между паузами от 0,3 с. Человек меняет язык
      на стыке предложений, а там пауза - смена языка совпадает с границей фразы.
   2. Язык фразы - детектор самой модели Whisper (вероятности ru/en), пакетом.
-     Вход дополняется до 10 с, а не до 30: в ~3,5 раза быстрее при тех же решениях
-     (до 5 с - уже ошибается). SpeechBrain VoxLingua107 проиграл на реальной записи
+     На MLX вход дополняется до 10 с, а не до 30: в ~3,5 раза быстрее при тех же
+     решениях (до 5 с - уже ошибается); CTranslate2 принимает только 30 с.
+     Движок (MLX или faster-whisper) - engine.py. SpeechBrain VoxLingua107 проиграл на реальной записи
      (английский с русским акцентом принимал за русский) - tests/compare_langid.py.
   3. Сглаживание: очень короткая неуверенная фраза между двумя фразами одного
      языка получает язык соседей и распознаётся вместе с ними.
@@ -26,10 +27,10 @@
 """
 import re
 import time
-import zlib
 
 import numpy as np
 
+import engine
 import vad
 
 SR = 16000
@@ -39,7 +40,6 @@ SHORT = 1.5            # короче - даже уверенный ответ �
 TINY = 1.0             # «одно-два слова»: кандидат на язык соседей
 BLOCK_MAX = 28.0       # блок одного языка - до ~30 с (одно окно Whisper)
 BLOCK_GAP = 3.0        # длинная пауза разрывает блок: меньше выдуманного текста на тишине
-LID_MIN_SEC = 10.0     # до скольких секунд дополнять вход детектора (5 с - мало: 12 ошибок на 116 фраз)
 
 _SENT = re.compile(r"[^.!?…]*[.!?…]")
 
@@ -50,155 +50,6 @@ def _script(text):
     if cyr + lat < 2:
         return None
     return "ru" if cyr > lat else "en"
-
-
-def _compression(text):
-    b = text.encode("utf-8")
-    return len(b) / max(1, len(zlib.compress(b)))
-
-
-class PhraseLID:
-    """Детектор языка и быстрое двойное распознавание на модели Whisper (MLX).
-    Модель - та же, что для распознавания (ModelHolder), второй раз не грузится."""
-
-    def __init__(self, model_repo, own=False):
-        import mlx.core as mx
-        from mlx_whisper.transcribe import ModelHolder
-        from mlx_whisper.tokenizer import get_tokenizer
-        self.mx = mx
-        if own:        # своя копия (маленькая модель-сито) - не вытесняет модель распознавания из ModelHolder
-            from mlx_whisper.load_models import load_model
-            self.model = load_model(model_repo, dtype=mx.float16)
-        else:
-            self.model = ModelHolder.get_model(model_repo, mx.float16)
-        nl = self.model.num_languages
-        self.tok = get_tokenizer(self.model.is_multilingual, num_languages=nl)
-        self.lang_id = {l: self.tok.to_language_token(l) for l in LANGS}
-        self.sot = {l: list(get_tokenizer(True, num_languages=nl, language=l, task="transcribe")
-                            .sot_sequence_including_notimestamps) for l in LANGS}
-        self.eot = self.tok.eot
-
-    # --- кодировщик на коротком входе ---
-    def _features(self, clips, min_sec=None):
-        import mlx.nn as nn
-        from mlx_whisper.audio import log_mel_spectrogram, pad_or_trim, N_FRAMES
-        mx = self.mx
-        min_sec = LID_MIN_SEC if min_sec is None else min_sec
-        T = int(min(N_FRAMES, max(min_sec * 100, max(len(c) for c in clips) / 160 + 2)))
-        T += T % 2
-        mel = mx.stack([pad_or_trim(log_mel_spectrogram(c[:30 * SR], self.model.dims.n_mels), T, axis=0)
-                        for c in clips]).astype(mx.float16)
-        enc = self.model.encoder
-        if T == N_FRAMES:
-            return enc(mel)
-        x = nn.gelu(enc.conv1(mel))
-        x = nn.gelu(enc.conv2(x))
-        x = x + enc._positional_embedding[: x.shape[1]]
-        for b in enc.blocks:
-            x, _, _ = b(x)
-        return enc.ln_post(x)
-
-    def p_en(self, clips, batch=16, prog=None, cancel=lambda: False):
-        """Вероятность английского для каждой фразы (среди ru/en)."""
-        mx = self.mx
-        out = np.zeros(len(clips))
-        order = np.argsort([len(c) for c in clips])       # похожие длины - в один пакет
-        for i in range(0, len(clips), batch):
-            if cancel():
-                from summary import Cancelled
-                raise Cancelled()
-            idx = order[i:i + batch]
-            feats = self._features([clips[j] for j in idx])
-            x = mx.array([[self.tok.sot]] * len(idx))
-            lg = self.model.logits(x, feats)[:, 0].astype(mx.float32)
-            two = mx.stack([lg[:, self.lang_id["ru"]], lg[:, self.lang_id["en"]]], axis=1)
-            out[idx] = np.array(mx.softmax(two, axis=1))[:, 1]
-            if prog:
-                prog(min(1.0, (i + len(idx)) / len(clips)))
-        return out
-
-    def top_lang(self, clips, batch=16, cancel=lambda: False):
-        """Самый вероятный язык фразы среди ВСЕХ языков Whisper и его вероятность."""
-        mx = self.mx
-        codes = list(self.tok.all_language_codes)
-        ids = list(self.tok.all_language_tokens)
-        out = [None] * len(clips)
-        order = np.argsort([len(c) for c in clips])
-        for i in range(0, len(clips), batch):
-            if cancel():
-                from summary import Cancelled
-                raise Cancelled()
-            idx = order[i:i + batch]
-            feats = self._features([clips[j] for j in idx])
-            x = mx.array([[self.tok.sot]] * len(idx))
-            lg = self.model.logits(x, feats)[:, 0].astype(mx.float32)
-            pr = np.array(mx.softmax(lg[:, mx.array(ids)], axis=1))
-            for k, j in enumerate(idx):
-                b = int(pr[k].argmax())
-                out[j] = (codes[b], float(pr[k, b]))
-        return out
-
-    def lang_probs(self, clips, langs=("ru", "en"), batch=32, cancel=lambda: False):
-        """Вероятности выбранных языков (среди всех языков Whisper) для каждой фразы."""
-        mx = self.mx
-        codes = list(self.tok.all_language_codes)
-        ids = list(self.tok.all_language_tokens)
-        cols = [codes.index(l) for l in langs]
-        out = np.zeros((len(clips), len(langs)))
-        order = np.argsort([len(c) for c in clips])
-        for i in range(0, len(clips), batch):
-            if cancel():
-                from summary import Cancelled
-                raise Cancelled()
-            idx = order[i:i + batch]
-            feats = self._features([clips[j] for j in idx])
-            x = mx.array([[self.tok.sot]] * len(idx))
-            lg = self.model.logits(x, feats)[:, 0].astype(mx.float32)
-            pr = np.array(mx.softmax(lg[:, mx.array(ids)], axis=1))
-            out[idx] = pr[:, cols]
-        return out
-
-    def dual(self, clip):
-        """Распознать фразу и как ru, и как en (жадно, одним пакетом на двоих).
-        -> {lang: (avg_logprob, compression_ratio, text)}"""
-        mx = self.mx
-        feats = self._features([clip], min_sec=30)
-        feats = mx.concatenate([feats, feats], axis=0)
-        max_new = int(min(120, 12 + len(clip) / SR * 9))
-        res = {}
-        toks = [self.sot[l] for l in LANGS]
-        x = mx.array(toks)
-        kv = None
-        out = [[] for _ in LANGS]
-        lp = [0.0 for _ in LANGS]
-        done = [False for _ in LANGS]
-        for step in range(max_new):
-            logits, kv, _ = self.model.decoder(x, feats, kv)
-            logits = logits[:, -1].astype(mx.float32)
-            # только обычные токены текста и конец
-            mask = np.zeros(logits.shape[-1], dtype=np.float32)
-            mask[self.eot + 1:] = -np.inf
-            if step == 0:
-                mask[self.eot] = -np.inf
-            logits = logits + mx.array(mask)
-            logp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-            nxt = np.array(mx.argmax(logp, axis=-1))
-            lpn = np.array(logp)[np.arange(len(LANGS)), nxt]
-            for k in range(len(LANGS)):
-                if done[k]:
-                    continue
-                lp[k] += float(lpn[k])
-                if int(nxt[k]) == self.eot:
-                    done[k] = True
-                else:
-                    out[k].append(int(nxt[k]))
-            if all(done):
-                break
-            x = mx.array(nxt.reshape(-1, 1))
-        for k, l in enumerate(LANGS):
-            text = self.tok.decode(out[k]).strip()
-            res[l] = (lp[k] / (len(out[k]) + 1), _compression(text) if text else 0.0, text)
-        return res
 
 
 def _choose(dual, p_en):
@@ -231,14 +82,9 @@ def _looped(segs):
     return any(s.get("compression_ratio", 0) > 2.4 for s in segs)
 
 
-_LID = {}
-
-
 def get_lid(model_repo):
-    if model_repo not in _LID:
-        _LID.clear()
-        _LID[model_repo] = PhraseLID(model_repo)
-    return _LID[model_repo]
+    """Детектор языка фраз выбранного движка (MLX или faster-whisper, см. engine.py)."""
+    return engine.get_engine().lid(model_repo)
 
 
 # --- проверка для «Авто»: есть ли в записи второй язык ---
@@ -249,7 +95,7 @@ def get_lid(model_repo):
 # 3) turbo перепроверяет сильные (до 40) и выборку слабых; если в выборке слабых нашёлся второй
 #    язык - и остальные слабые.
 # Замеры - tests/measure_auto.py, docs/Приёмка 2.3.md.
-SIEVE_REPO = "mlx-community/whisper-base-mlx"
+SIEVE_REPO = "base"   # whisper-base: MLX на Mac, CTranslate2 на Windows и Linux
 SIEVE_STRONG = 0.3     # у сита p(второй язык) от 0,3 - сильная отметка (настоящие русские фразы: от 0,77)
 SIEVE_WEAK = 0.5       # у сита p(основной язык) ниже 0,5 - слабая отметка
 VERIFY_MAX = 40        # больше фраз turbo не перепроверяет
@@ -270,7 +116,7 @@ _SIEVE = {}
 def _get_sieve():
     if "lid" not in _SIEVE:
         try:
-            _SIEVE["lid"] = PhraseLID(SIEVE_REPO, own=True)
+            _SIEVE["lid"] = engine.get_engine().lid(SIEVE_REPO, own=True)
         except Exception:
             _SIEVE["lid"] = None            # нет сети и модели в кэше - пойдём запасным путём
     return _SIEVE["lid"]

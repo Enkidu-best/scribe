@@ -1,8 +1,13 @@
-mlx-whisper
+# Распознавание: Mac с Apple Silicon - MLX; Windows, Linux и Mac на Intel - faster-whisper (CTranslate2)
+mlx-whisper; sys_platform == "darwin" and platform_machine == "arm64"
+faster-whisper>=1.1; sys_platform != "darwin" or platform_machine != "arm64"
 customtkinter
 tkinterdnd2
 python-docx
-pyannote.audio
 numpy
 sounddevice
 onnxruntime
+platformdirs
+huggingface_hub
+# Определение говорящих (необязательно, тянет torch)
+pyannote.audio

@@ -1,0 +1,68 @@
+name: Проверки (Windows, Linux)
+
+on:
+  push:
+    branches: [main, "dev/**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  linux:
+    name: Linux · процессор
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: ffmpeg и голоса espeak-ng
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg espeak-ng
+      - name: Зависимости (без окна)
+        run: pip install -r requirements-cli.txt
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-linux-ct2-v2
+      - name: Движок
+        run: python scribe_cli.py --engine
+      - name: Автотесты нарезки
+        run: python tests/test_vad.py
+      - name: Расшифровка («Авто», английская и смешанная ru/en)
+        run: python tests/smoke_cli.py
+      - name: Скорость (2 мин, процессор)
+        run: python tests/speed_cli.py
+      - name: Задержка диктофона (turbo / medium / small)
+        run: python tests/dict_latency.py
+
+  windows:
+    name: Windows · процессор
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: ffmpeg
+        run: choco install ffmpeg -y --no-progress
+      - name: Зависимости (без окна)
+        run: pip install -r requirements-cli.txt
+      - uses: actions/cache@v4
+        with:
+          path: ~\.cache\huggingface
+          key: hf-windows-ct2-v2
+      - name: Движок
+        run: python scribe_cli.py --engine
+      - name: Автотесты нарезки
+        run: python tests/test_vad.py
+      - name: Расшифровка («Авто», английская запись)
+        run: python tests/smoke_cli.py
+      - name: Скорость (2 мин, процессор)
+        run: python tests/speed_cli.py
+      - name: Задержка диктофона (turbo / medium / small)
+        run: python tests/dict_latency.py
+      - name: Ссылки на библиотеки NVIDIA (без скачивания)
+        run: python -c "import models; [print(p, models._wheel_url(p, 'win_amd64')) for p in models.NVIDIA_PKGS]"
