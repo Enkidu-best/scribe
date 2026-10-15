@@ -84,7 +84,7 @@ DIAR_STEPS = {"segmentation": "разбивка на фрагменты", "speak
 FORMATS_AUDIO = "MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, AIFF, WMA, M4B, AMR"
 FORMATS_VIDEO = "MP4, MOV, MKV, WEBM, WMV, AVI, FLV, 3GP, TS, MPG"
 
-APP_VERSION = "2.4"
+APP_VERSION = "2.5"
 CONFIG_PATH = pu.config_path()     # Mac - прежний ~/.audio2text.json; Windows/Linux - папка настроек системы
 # Пробуем модели по порядку: сначала новая community-1 (её тянут свежие версии
 # pyannote и она точнее), затем классическая 3.1 как запасная.
@@ -298,18 +298,20 @@ def transcribe_auto(audio, model_repo, eng, prog, cancel, stage=None, forced=Non
     сито whisper-base + перепроверка turbo).
     В записи есть и русский, и английский - обрабатываем как «Несколько»; иначе - один язык,
     найденный проверкой (а не только по первым 30 с, как решал бы сам Whisper).
-    forced - язык, выбранный вручную: режим не меняем, только сообщаем о другом языке.
+    forced - язык, выбранный вручную: проверки языков нет вообще (2.5, решение Андрея) - пользователь
+    выбрал язык сам, вся запись распознаётся на нём.
     -> (segments, info)"""
     import multilang
     stage = stage or (lambda k, d="": None)
+    if forced:
+        info = dict(mode="single", lang=forced)
+        stage("asr")
+        prog(0)
+        return _transcribe_array(eng, audio, model_repo, forced, prog, cancel), info
+    stage("prep", "проверка языков")
     probe = multilang.probe_languages(audio, model_repo, cancel)
     info = dict(probe=probe)
-    if forced:
-        other = {"ru": "en", "en": "ru"}[forced]
-        if probe["dominant"] == other or multilang.has_language(probe, other):
-            info["forced_other"] = other
-        lang = forced
-    elif probe["mixed"]:
+    if probe["mixed"]:
         if on_mixed:
             on_mixed(probe)
         info["mode"] = "mixed"

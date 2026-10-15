@@ -25,6 +25,7 @@
 
 Никаких словарей и правил под конкретную запись - только общие критерии.
 """
+import os
 import re
 import time
 
@@ -87,6 +88,18 @@ def get_lid(model_repo):
     return engine.get_engine().lid(model_repo)
 
 
+def lite():
+    """На процессоре (Windows/Linux без NVIDIA) язык фраз определяет только сито whisper-base,
+    без перепроверки большой моделью: CTranslate2 считает каждую короткую фразу полным окном 30 с,
+    и проверка turbo делала смешанную запись в 2-2,5 раза длиннее самой записи (Scribe 2.5,
+    решение Андрея; замер - docs/Приёмка 2.5.md). На Mac и NVIDIA - как раньше.
+    SCRIBE_LID=lite|full - принудительно (для замеров)."""
+    v = os.environ.get("SCRIBE_LID", "").lower()
+    if v in ("lite", "full"):
+        return v == "lite"
+    return getattr(engine.get_engine(), "device", "") == "cpu"
+
+
 # --- проверка для «Авто»: есть ли в записи второй язык ---
 # 1) основной язык - turbo по нескольким фразам, равномерно по записи;
 # 2) сито - маленькая модель whisper-base (~25 мс на фразу, в 15-20 раз дешевле turbo) - смотрит
@@ -107,6 +120,7 @@ PROBE_CLIP = 10.0      # для языка хватает 10 с из серед�
 PROBE_SURE = 0.9       # turbo подтверждает только уверенным ответом
 MIX_MIN = 2            # смешанная: не меньше двух подтверждённых фраз второго языка
 MIX_TIME = 0.02        # и они занимают не меньше 2 % времени речи (одна случайная фраза - нет)
+LITE_SURE = 0.7        # процессор: фразу второго языка подтверждает само сито, если уверено от 0,7
 # запасной путь, если whisper-base недоступна: выборка фраз и только turbo
 PROBE_N, PROBE_PER_MIN, PROBE_N_MIN = 60, 8, 20
 
@@ -195,6 +209,13 @@ def probe_languages(audio, model_repo, cancel=lambda: False):
         weak = [c for c, (pd, po) in zip(cands, P) if po < SIEVE_STRONG and pd < SIEVE_WEAK]
         strong.sort(key=lambda c: -P[cands.index(c)][1])
         method = f"сито whisper-base + turbo (основной язык - {dom_by})"
+    if other and sieve is not None and lite():
+        # процессор: второй язык подтверждает само сито - уверенно и больше, чем основной
+        method = f"сито whisper-base без перепроверки (процессор; основной язык - {dom_by})"
+        for c, (pd, po) in zip(cands, P):
+            if po >= LITE_SURE and po > pd:
+                checked[c] = (other, float(po))
+    elif other and sieve is not None:
         # 3) перепроверка turbo: сильные - порциями от самых подозрительных; порция без единой
         #    фразы второго языка - дальше (ещё менее подозрительные) не смотрим
         for i in range(0, min(len(strong), VERIFY_MAX), VERIFY_STEP):
@@ -218,8 +239,9 @@ def probe_languages(audio, model_repo, cancel=lambda: False):
     else:
         method = "turbo (основной язык не ru/en)"
     confirmed, ctime, hits = {}, {}, []
+    sure = LITE_SURE if method.startswith("сито whisper-base без") else PROBE_SURE
     for (a, b), (lang, pr) in sorted(checked.items()):
-        if pr >= PROBE_SURE and lang != dom:
+        if pr >= sure and lang != dom:
             confirmed[lang] = confirmed.get(lang, 0) + 1
             ctime[lang] = ctime.get(lang, 0.0) + (b - a)
             if lang == other:
@@ -241,7 +263,7 @@ def plan(audio, model_repo, prog=lambda f: None, cancel=lambda: False, stats=Non
     if not phrases:
         return []
     t_vad = time.monotonic() - t0
-    lid = get_lid(model_repo)
+    lid = (_get_sieve() if lite() else None) or get_lid(model_repo)    # процессор - сито whisper-base
     clips = [audio[int(a * SR):int(b * SR)] for a, b in phrases]
     t0 = time.monotonic()
     p = lid.p_en(clips, prog=lambda f: prog(0.7 * f), cancel=cancel)
@@ -277,7 +299,7 @@ def plan(audio, model_repo, prog=lambda f: None, cancel=lambda: False, stats=Non
         prog(0.7 + 0.3 * (k + 1) / len(unsure))
     prog(1.0)
     if stats is not None:
-        stats.update(phrases=len(phrases), smoothed=n_smooth, dual=n_dual,
+        stats.update(phrases=len(phrases), smoothed=n_smooth, dual=n_dual, lite=lite(),
                      en=sum(1 for x in lang if x == "en"), t_vad=round(t_vad, 1), t_lid=round(t_lid, 1),
                      t_dual=round(time.monotonic() - t0, 1))
     # блоки: соседние фразы одного языка, до BLOCK_MAX и без длинных пауз внутри

@@ -97,10 +97,16 @@ from core import (  # noqa: F401 - всё ядро доступно и как wh
 
 # ---------------------------------------------------------------------------
 # Интерфейс
+OPT_KEYS = ("lang", "fmt", "diar", "nspk", "ts", "summary")
+
+
 class Job:
-    """Один файл в списке: путь, статус и результаты."""
-    def __init__(self, path):
+    """Один файл в списке: путь, статус, результаты и свои настройки (язык, формат, говорящие,
+    таймкоды, итоги). Настройки берутся из панели справа при добавлении файла."""
+    def __init__(self, path, opts=None):
         self.path = path
+        self.opts = dict(opts or {})
+        self.locked = False        # файл взят в работу - его настройки больше не меняются
         try:
             self.size = path.stat().st_size
         except OSError:
@@ -130,12 +136,14 @@ class FileRow(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent", corner_radius=0)
         self.job, self.app = job, app
         self.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(self, text="", image=T.icon("file-text" if job.kind == "text" else "audio-lines", T.MUTED, 18)
-                     ).grid(row=0, column=0, rowspan=2, padx=(14, 10), pady=(12, 0), sticky="n")
-        T.label(self, _short(job.path.name, 64), 14, bold=True, anchor="w"
-                ).grid(row=0, column=1, sticky="ew", pady=(10, 0))
+        icon_lbl = ctk.CTkLabel(self, text="", image=T.icon("file-text" if job.kind == "text" else "audio-lines",
+                                                            T.MUTED, 18))
+        icon_lbl.grid(row=0, column=0, rowspan=2, padx=(14, 10), pady=(12, 0), sticky="n")
+        name_lbl = T.label(self, _short(job.path.name, 64), 14, bold=True, anchor="w")
+        name_lbl.grid(row=0, column=1, sticky="ew", pady=(10, 0))
         self.meta = T.label(self, "", 12, color=T.MUTED, anchor="w")
-        self.meta.grid(row=1, column=1, sticky="ew", pady=(0, 8))
+        self.meta.grid(row=1, column=1, sticky="ew", pady=(0, 2))
+        self.opts_lbl = T.label(self, "", 12, color=T.ACCENT, anchor="w")   # «Авто · Word · говорящие · итоги»
         self.chip = T.chip(self)
         self.chip.grid(row=0, column=2, rowspan=2, padx=(8, 4), sticky="e")
         self.rm = T.button(self, "", "x", kind="ghost", height=28, command=lambda: app.remove_job(job))
@@ -143,12 +151,21 @@ class FileRow(ctk.CTkFrame):
         self.acts = ctk.CTkFrame(self, fg_color="transparent", width=1, height=1)
         self.note = T.label(self, "", 12, color=T.BAD, anchor="w", justify="left", wraplength=460)
         ctk.CTkFrame(self, height=1, fg_color=T.BORDER, corner_radius=0
-                     ).grid(row=4, column=0, columnspan=4, sticky="ew")
+                     ).grid(row=5, column=0, columnspan=4, sticky="ew")
+        # щелчок по карточке выделяет файл; Cmd/Ctrl - добавить к выделению, Shift - диапазон
+        for w in (self, name_lbl, icon_lbl, self.meta, self.opts_lbl, self.note):
+            w.bind("<Button-1>", lambda e: app.select(job, e))
         self.refresh()
 
     def refresh(self):
         j = self.job
-        est = self.app.estimate(j.duration) if j.kind == "audio" and j.state == "queue" else None
+        self.configure(fg_color=T.ACCENT_SOFT if j in self.app.sel else "transparent")
+        if j.kind == "audio":
+            self.opts_lbl.configure(text=self.app.opts_line(j))
+            self.opts_lbl.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(0, 8))
+        else:
+            self.opts_lbl.grid_remove()
+        est = self.app.estimate(j.duration, j) if j.kind == "audio" and j.state == "queue" else None
         meta = [x for x in ("готовая расшифровка" if j.kind == "text" else "", _fmt_dur(j.duration),
                             _fmt_size(j.size) if j.size else "", j.path.parent.name,
                             (f"≈ {max(10, round(est / 10) * 10)} с" if est < 90 else f"≈ {round(est / 60)} мин") + " на этом компьютере" if est else "") if x]
@@ -160,7 +177,7 @@ class FileRow(ctk.CTkFrame):
         for w in self.acts.winfo_children():
             w.destroy()
         if j.state == "done" and j.out:
-            self.acts.grid(row=2, column=1, columnspan=3, sticky="w", pady=(0, 10))
+            self.acts.grid(row=3, column=1, columnspan=3, sticky="w", pady=(0, 10))
             T.button(self.acts, "Открыть", "file-text", height=28, size=13, width=100,
                      command=lambda: _open(j.out)).pack(side="left", padx=(0, 4))
             if j.summary:
@@ -186,7 +203,7 @@ class FileRow(ctk.CTkFrame):
             color = T.WARN if j.warn else T.ACCENT
         if msg:
             self.note.configure(text=msg, text_color=color)
-            self.note.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(0, 10))
+            self.note.grid(row=4, column=1, columnspan=3, sticky="ew", pady=(0, 10))
         else:
             self.note.grid_remove()
         self.rm.configure(state="disabled" if self.app.running else "normal")
@@ -194,6 +211,13 @@ class FileRow(ctk.CTkFrame):
 
 def _open(path):
     pu.open_path(path)
+
+
+def _files_word(n):
+    n = abs(n) % 100
+    if 11 <= n <= 14:
+        return "файлов"
+    return {1: "файл", 2: "файла", 3: "файла", 4: "файла"}.get(n % 10, "файлов")
 
 
 def _first_line(e, n=220):
@@ -315,6 +339,15 @@ class App:
         self.stage_text = ""
         self.dict_page = None
         self.page = None
+        self.sel = []                   # выделенные файлы: панель справа показывает и меняет их настройки
+        self.anchor = None              # от какого файла считать диапазон при Shift-щелчке
+        self._loading = False           # панель заполняется из файла - это не изменение настроек
+        self.defaults = dict(           # настройки для новых файлов - последние выбранные
+            lang=cfg.get("lang") if cfg.get("lang") in LANG_SEG else "Авто",
+            fmt=cfg.get("fmt") if cfg.get("fmt") in FMT_SEG else "Word",
+            diar=cfg.get("diar", bool(cfg.get("hf_token"))),
+            nspk=cfg.get("nspk") if cfg.get("nspk") in NSPK else "Авто",
+            ts=cfg.get("ts", False), summary=cfg.get("summary", False))
 
         root.title("Scribe")
         root.geometry("1180x760")
@@ -346,6 +379,7 @@ class App:
             root.dnd_bind("<<DropEnter>>", lambda e: self._drag(True))
             root.dnd_bind("<<DropLeave>>", lambda e: self._drag(False))
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        root.bind("<Escape>", lambda e: self.clear_selection())
         self.root.after(120, self._drain)
         self.root.after(500, self._tick)
         self.root.after(600, self._prebuild_dict)
@@ -476,12 +510,13 @@ class App:
         sp[k] = round(r if k not in sp else 0.6 * sp[k] + 0.4 * r, 4)
         save_config(self.cfg)
 
-    def estimate(self, duration):
+    def estimate(self, duration, job):
         """Сколько займёт файл - по прошлым расшифровкам на ЭТОЙ машине (а не по цифрам с Mac)."""
         if not duration or self.eng is None:
             return None
-        mode = "mixed" if self.lang_seg.get() == "Несколько" else "single"
-        r = self.cfg.get("speed", {}).get(self._speed_key(mode, self.diar_var.get()))
+        mode = "mixed" if job.opts.get("lang") == "Несколько" else "single"
+        diar = job.opts.get("diar") and self._diar_ready()
+        r = self.cfg.get("speed", {}).get(self._speed_key(mode, diar))
         return r * duration if r else None
 
     def _prebuild_dict(self):
@@ -585,41 +620,65 @@ class App:
         ctk.CTkFrame(self.list_wrap, height=1, fg_color=T.BORDER, corner_radius=0).pack(fill="x")
         self.rows = ctk.CTkScrollableFrame(self.list_wrap, fg_color="transparent", corner_radius=0)
         self.rows.pack(fill="both", expand=True, padx=(1, 1), pady=(0, 6))
+        for w in (self.rows, getattr(self.rows, "_parent_canvas", None)):
+            if w is not None:
+                w.bind("<Button-1>", lambda e: self.clear_selection() if e.widget in
+                       (self.rows, getattr(self.rows, "_parent_canvas", None)) else None)
 
     def _build_options(self, card):
-        o = ctk.CTkFrame(card, fg_color="transparent")
-        o.pack(fill="both", expand=True, padx=18, pady=16)
+        # панель прокручивается, если не помещается (маленькое окно, все галочки включены);
+        # полоса прокрутки видна только тогда
+        self.opt_scroll = ctk.CTkScrollableFrame(card, fg_color="transparent", corner_radius=0, width=290)
+        self.opt_scroll.pack(fill="both", expand=True, padx=(18, 4), pady=(16, 10))
+        o = ctk.CTkFrame(self.opt_scroll, fg_color="transparent")
+        o.pack(fill="both", expand=True, padx=(0, 10))
+        self._opt_inner = o
+        self.opt_scroll._parent_canvas.bind("<Configure>", lambda e: self.root.after_idle(self._fit_panel), add="+")
         ctk.CTkFrame(o, width=280, height=0, fg_color="transparent").pack()   # держит ширину колонки
-        cfg = self.cfg
+        d = self.defaults
+
+        # чьи это настройки: выделенного файла (файлов) или новых
+        head = ctk.CTkFrame(o, fg_color="transparent")
+        head.pack(fill="x", pady=(0, 10))
+        self.panel_title = T.label(head, "Настройки для новых файлов", 15, bold=True, anchor="w")
+        self.panel_title.pack(fill="x")
+        # одна строка под заголовком: подсказка, предупреждение или «Снять выделение»
+        self.panel_sub = T.label(head, "", 12, color=T.MUTED, anchor="w", justify="left", wraplength=280)
+        self.panel_sub.pack(fill="x", pady=(2, 0))
+        self.panel_sub.bind("<Button-1>", lambda e: self.clear_selection() if self.sel else None)
 
         T.section(o, "Язык записи").pack(fill="x")
-        self.lang_seg = T.Segmented(o, LANG_SEG, command=lambda v: self._lang_hint(), size=12)
-        self.lang_seg.set(cfg.get("lang", "Авто") if cfg.get("lang") in LANG_SEG else "Авто")
+        self.lang_seg = T.Segmented(o, LANG_SEG, command=lambda v: (self._lang_hint(), self._opt_changed("lang")),
+                                    size=12)
+        self.lang_seg.set(d["lang"])
         self.lang_seg.pack(fill="x", pady=(6, 4))
         self.lang_note = T.label(o, "", 12, color=T.MUTED, anchor="w", justify="left", wraplength=280)
         self.lang_note.pack(fill="x")
         self._lang_hint()
 
-        T.section(o, "Формат результата").pack(fill="x", pady=(16, 0))
-        self.fmt_seg = T.Segmented(o, list(FMT_SEG), command=lambda v: self._sync_opts(), size=12)
-        self.fmt_seg.set(cfg.get("fmt", "Word") if cfg.get("fmt") in FMT_SEG else "Word")
+        T.section(o, "Формат результата").pack(fill="x", pady=(12, 0))
+        self.fmt_seg = T.Segmented(o, list(FMT_SEG), command=lambda v: (self._sync_opts(), self._opt_changed("fmt")),
+                                   size=12)
+        self.fmt_seg.set(d["fmt"])
         self.fmt_seg.pack(fill="x", pady=(6, 4))
         T.label(o, "Каким файлом сохранить расшифровку:\nWord - .docx  ·  Текст - .txt  ·  Субтитры - .srt",
                 12, color=T.MUTED, anchor="w", justify="left", wraplength=280).pack(fill="x")
 
-        ctk.CTkFrame(o, height=1, fg_color=T.BORDER, corner_radius=0).pack(fill="x", pady=16)
+        ctk.CTkFrame(o, height=1, fg_color=T.BORDER, corner_radius=0).pack(fill="x", pady=12)
         T.section(o, "Дополнительно").pack(fill="x", pady=(0, 8))
 
-        self.diar_var = ctk.BooleanVar(value=cfg.get("diar", bool(cfg.get("hf_token"))))
+        self.diar_var = ctk.BooleanVar(value=d["diar"])
         self.diar_cb = ctk.CTkCheckBox(o, text="Определять говорящих", variable=self.diar_var,
-                                       font=T.font(14), command=self._sync_opts, checkbox_width=20,
-                                       checkbox_height=20)
+                                       font=T.font(14), command=lambda: (self._sync_opts(), self._opt_changed("diar")),
+                                       checkbox_width=20, checkbox_height=20)
         self.diar_cb.pack(anchor="w")
         self.nspk_row = ctk.CTkFrame(o, fg_color="transparent")
         T.label(self.nspk_row, "Сколько человек", 13, color=T.MUTED).pack(side="left")
-        self.nspk_var = ctk.StringVar(value=cfg.get("nspk", "Авто") if cfg.get("nspk") in NSPK else "Авто")
-        ctk.CTkOptionMenu(self.nspk_row, variable=self.nspk_var, values=list(NSPK), width=90, height=28,
-                          font=T.font(13), dropdown_font=T.font(13)).pack(side="left", padx=(10, 0))
+        self.nspk_var = ctk.StringVar(value=d["nspk"])
+        self.nspk_menu = ctk.CTkOptionMenu(self.nspk_row, variable=self.nspk_var, values=list(NSPK), width=90,
+                                           height=28, font=T.font(13), dropdown_font=T.font(13),
+                                           command=lambda v: self._opt_changed("nspk"))
+        self.nspk_menu.pack(side="left", padx=(10, 0))
         self.token_link = T.label(o, "Нужен токен Hugging Face или офлайн-пакет моделей - Настройки", 12,
                                   color=T.ACCENT,
                                   anchor="w", justify="left", wraplength=250, cursor=pu.HAND)
@@ -627,24 +686,39 @@ class App:
         self.diar_hint = T.label(o, "Метки «Спикер 1, 2…». Заметно дольше.", 12, color=T.MUTED, anchor="w",
                                  justify="left", wraplength=250)
 
-        self.ts_var = ctk.BooleanVar(value=cfg.get("ts", False))
+        self.ts_var = ctk.BooleanVar(value=d["ts"])
         self.ts_cb = ctk.CTkCheckBox(o, text="Таймкоды в тексте", variable=self.ts_var, font=T.font(14),
-                                     checkbox_width=20, checkbox_height=20)
+                                     checkbox_width=20, checkbox_height=20, command=lambda: self._opt_changed("ts"))
         self.ts_cb.pack(anchor="w", pady=(12, 0))
 
-        self.sum_var = ctk.BooleanVar(value=cfg.get("summary", False))
+        self.sum_var = ctk.BooleanVar(value=d["summary"])
         self.sum_cb = ctk.CTkCheckBox(o, text="Итоги (отдельный файл)", variable=self.sum_var, font=T.font(14),
-                                      checkbox_width=20, checkbox_height=20)
+                                      checkbox_width=20, checkbox_height=20,
+                                      command=lambda: self._opt_changed("summary"))
         self.sum_cb.pack(anchor="w", pady=(12, 0))
         self.sum_hint = T.label(o, "", 12, color=T.MUTED, anchor="w", justify="left", wraplength=250)
         self.sum_hint.pack(fill="x", padx=(30, 0), pady=(2, 0))
         self.sum_hint.bind("<Button-1>", lambda e: None if ollama_installed() else self.explain_ollama())
         self._sync_opts()
 
+    def _fit_panel(self):
+        try:
+            need = self._opt_inner.winfo_reqheight()
+            have = self.opt_scroll._parent_canvas.winfo_height()
+            bar = self.opt_scroll._scrollbar
+            if need <= have + 2:
+                bar.grid_remove()
+                self.opt_scroll._parent_canvas.yview_moveto(0)
+            else:
+                bar.grid()
+        except Exception:
+            pass
+
     def _lang_hint(self):
         v = self.lang_seg.get()
         self.lang_note.configure(text=LANG_HINT.get(
-            v, f"Вся запись распознаётся как «{v}». Если в ней окажется и другой язык - предупредим."))
+            v, f"Вся запись распознаётся как «{v}», без проверки языков. Если в записи есть и другой "
+               "язык - выберите «Авто» или «Несколько»."))
 
     def _sync_opts(self):
         """Согласовать опции между собой: без токена говорящих не включить,
@@ -670,14 +744,130 @@ class App:
         ext = "Word" if self.fmt_seg.get() == "Word" else ".txt"
         if ollama_installed():
             self.sum_cb.configure(state="normal")
-            self.sum_hint.configure(text=f"Суть, решения и задачи - отдельным документом ({ext}) рядом с "
-                                         "полной расшифровкой. Готовит локальная модель через Ollama.",
+            self.sum_hint.configure(text=f"Суть, решения и задачи - отдельным документом ({ext}). "
+                                         "Готовит локальная модель через Ollama.",
                                     text_color=T.MUTED)
         else:
             self.sum_var.set(False)
             self.sum_cb.configure(state="disabled")
             self.sum_hint.configure(text="Нужна Ollama - бесплатная программа для локальной модели. "
                                          "Как поставить - нажмите здесь.", text_color=T.WARN)
+        self.root.after_idle(self._fit_panel)
+
+    # ---------- настройки каждого файла ----------
+    def opts_line(self, job):
+        """Короткая строка настроек на карточке: «Авто · Word · говорящие · итоги»."""
+        o = job.opts
+        parts = [o["lang"], o["fmt"]]
+        if o["diar"] and self._diar_ready():
+            parts.append("говорящие" + (f" ({o['nspk']})" if o["nspk"] != "Авто" else ""))
+        if o["ts"] and o["fmt"] != "Субтитры":
+            parts.append("таймкоды")
+        if o["summary"] and ollama_installed():
+            parts.append("итоги")
+        return "  ·  ".join(parts)
+
+    def _editable(self, job):
+        return not job.locked and job.state != "run"
+
+    def select(self, job, event=None):
+        """Щелчок по карточке. Cmd (Mac) / Ctrl - добавить или убрать файл, Shift - диапазон."""
+        audio = [j for j in self.jobs if j.kind == "audio"]
+        if job.kind != "audio":
+            return
+        st = getattr(event, "state", 0) or 0
+        add = bool(st & 0x0008) if pu.IS_MAC else bool(st & 0x0004)
+        if st & 0x0001 and self.anchor in audio:                 # Shift: от якоря до этого файла
+            a, b = sorted((audio.index(self.anchor), audio.index(job)))
+            self.sel = audio[a:b + 1]
+        elif add:
+            self.sel = [j for j in self.sel if j is not job] if job in self.sel else self.sel + [job]
+            self.anchor = job
+        elif self.sel == [job]:                                   # повторный щелчок - снять выделение
+            self.sel, self.anchor = [], None
+        else:
+            self.sel, self.anchor = [job], job
+        self._after_select()
+
+    def clear_selection(self):
+        if self.sel:
+            self.sel, self.anchor = [], None
+            self._after_select()
+
+    def _after_select(self):
+        for j in self.jobs:
+            if j.row is not None and j.row.winfo_exists():
+                j.row.refresh()
+        self._panel_load()
+
+    def _panel_load(self):
+        """Панель справа показывает настройки выделенного файла (первого из выделенных)
+        или настройки для новых файлов."""
+        src = self.sel[0].opts if self.sel else self.defaults
+        self._loading = True
+        try:
+            self.lang_seg.set(src["lang"])
+            self.fmt_seg.set(src["fmt"])
+            self.diar_var.set(src["diar"])
+            self.nspk_var.set(src["nspk"])
+            self.ts_var.set(src["ts"])
+            self.sum_var.set(src["summary"])
+            self._lang_hint()
+            self._sync_opts()
+        finally:
+            self._loading = False
+        n = len(self.sel)
+        locked = [j for j in self.sel if not self._editable(j)]
+        done = [j for j in self.sel if self._editable(j) and j.state in ("done", "error", "cancel")]
+        if not n:
+            title, sub, color = "Настройки для новых файлов", "Щелчок по файлу - настройки только ему", T.MUTED
+        else:
+            title = f"Настройки: {_short(self.sel[0].path.name, 26)}" if n == 1 else f"Настройки: {n} {_files_word(n)}"
+            if len(locked) == n:
+                sub, color = "Файл уже в работе - не меняется  ·  Снять выделение", T.WARN
+            elif locked:
+                sub, color = "Файл в работе не изменится  ·  Снять выделение", T.WARN
+            elif done:
+                sub, color = "Изменить - и файл расшифруется заново  ·  Снять выделение", T.ACCENT
+            else:
+                sub, color = "Снять выделение", T.ACCENT
+        self.panel_title.configure(text=title)
+        self.panel_sub.configure(text=sub, text_color=color, cursor=pu.HAND if n else "")
+        st = "disabled" if self.sel and len(locked) == len(self.sel) else "normal"
+        for w in (self.lang_seg, self.fmt_seg):
+            w.set_state(st)
+        self.nspk_menu.configure(state=st)
+        if st == "disabled":
+            for w in (self.diar_cb, self.ts_cb, self.sum_cb):
+                w.configure(state="disabled")
+
+    def _opt_changed(self, key):
+        """Изменили настройку в панели: выделенным файлам (кроме того, что уже в работе) - и как
+        «последнюю выбранную» для новых файлов."""
+        if self._loading:
+            return
+        val = {"lang": self.lang_seg.get, "fmt": self.fmt_seg.get, "diar": self.diar_var.get,
+               "nspk": self.nspk_var.get, "ts": self.ts_var.get, "summary": self.sum_var.get}[key]()
+        self.defaults[key] = val
+        self._save_prefs()
+        for j in self.sel:
+            if not self._editable(j) or j.opts.get(key) == val:
+                continue
+            j.opts[key] = val
+            if j.state in ("done", "error", "cancel"):             # готовый файл - снова в очередь
+                j.state, j.error, j.warn, j.info, j.stage = "queue", "", "", "", ""
+                j.out, j.summary, j.segments, j.diarized = None, None, None, False
+            j.row.refresh()
+        if self.sel:
+            self._panel_load()
+
+    def _job_opts(self, job, base):
+        """Настройки файла для обработки - читаются в момент, когда файл берётся в работу."""
+        o = job.opts
+        fmt = FMT_SEG[o["fmt"]]
+        return dict(base, lang=LANG_CODE.get(o["lang"]), multilang=(o["lang"] == "Несколько"), fmt=fmt,
+                    with_ts=o["ts"] and fmt != "srt", diar=o["diar"] and self._diar_ready(),
+                    nspk=NSPK[o["nspk"]], summary=o["summary"] and ollama_installed())
 
     # ---------- файлы ----------
     def _refresh_files(self):
@@ -705,7 +895,7 @@ class App:
         for path in found:
             if path not in have:
                 have.add(path)
-                job = Job(path)
+                job = Job(path, self.defaults)                # новый файл - с последними настройками
                 job.row = FileRow(self.rows, job, self)
                 job.row.pack(fill="x")
                 self.jobs.append(job)
@@ -716,6 +906,9 @@ class App:
         self._refresh_files()
         audio = [j for j in new if j.kind == "audio"]
         if audio:
+            # только что добавленные файлы выделены: поменяли язык или формат - это для них
+            self.sel, self.anchor = list(audio), audio[0]
+            self._after_select()
             threading.Thread(target=self._probe, args=(audio,), daemon=True).start()
 
     def _probe(self, jobs):
@@ -746,6 +939,9 @@ class App:
             return
         job.row.destroy()
         self.jobs.remove(job)
+        if job in self.sel:
+            self.sel = [j for j in self.sel if j is not job]
+            self._panel_load()
         self._refresh_files()
 
     def clear_files(self):
@@ -754,6 +950,8 @@ class App:
         for j in self.jobs:
             j.row.destroy()
         self.jobs.clear()
+        self.sel, self.anchor = [], None
+        self._panel_load()
         self._refresh_files()
         self.progress.set(0)
         self._set_status("Добавьте файлы - и нажмите «Расшифровать».")
@@ -825,6 +1023,8 @@ class App:
                         self.cur_job = job
                     if job.row is not None and job.row.winfo_exists():
                         job.row.refresh()
+                    if job in self.sel:
+                        self._panel_load()
                 elif kind == "token":
                     self._token_result(*msg[1])
                 elif kind == "engine":
@@ -839,8 +1039,7 @@ class App:
 
     # ---------- запуск ----------
     def _save_prefs(self):
-        self.cfg.update(lang=self.lang_seg.get(), fmt=self.fmt_seg.get(), diar=self.diar_var.get(),
-                        nspk=self.nspk_var.get(), ts=self.ts_var.get(), summary=self.sum_var.get())
+        self.cfg.update({k: self.defaults[k] for k in OPT_KEYS})
         save_config(self.cfg)
 
     def start(self):
@@ -857,17 +1056,11 @@ class App:
             self._set_status("В списке только готовые расшифровки - для них есть «Подвести итоги».", T.WARN)
             return
         pending = [j for j in audio_jobs if j.state != "done"] or audio_jobs
-        sel = self.lang_seg.get()
-        fmt = FMT_SEG[self.fmt_seg.get()]
-        opts = dict(
-            lang=LANG_CODE.get(sel), multilang=(sel == "Несколько"),
-            model=self.cfg.get("model_repo", MODEL_REPO), fmt=fmt,
-            with_ts=self.ts_var.get() and fmt != "srt",
-            diar=self.diar_var.get() and self._diar_ready(),
-            nspk=NSPK[self.nspk_var.get()], token=self.cfg.get("hf_token", ""),
-            normalize=self.cfg.get("normalize", True),
-            summary=self.sum_var.get(), sum_model=self.cfg.get("summary_model", summary.DEFAULT_MODEL),
-            outs={id(j): self._out_path(j, fmt, audio_jobs) for j in pending})
+        # общее для всех файлов; язык, формат, говорящие, таймкоды и итоги - у каждого свои
+        # (_job_opts, в момент, когда файл берётся в работу)
+        opts = dict(model=self.cfg.get("model_repo", MODEL_REPO), token=self.cfg.get("hf_token", ""),
+                    normalize=self.cfg.get("normalize", True),
+                    sum_model=self.cfg.get("summary_model", summary.DEFAULT_MODEL), all_jobs=list(audio_jobs))
         self._save_prefs()
         for j in pending:
             j.state, j.error, j.warn, j.stage, j.out, j.summary, j.info = "queue", "", "", "", None, None, ""
@@ -952,12 +1145,12 @@ class App:
         except Exception as e:
             self.q.put(("done", ("error", "Не найден движок распознавания:\n  pip install faster-whisper\n"
                                           "(на Mac: pip install mlx-whisper)\n\n" + str(e)))); return
-        if o["fmt"] == "docx":
+        if any(j.opts.get("fmt") == "Word" for j in jobs):
             try:
                 import docx  # noqa
             except Exception:
                 self.q.put(("done", ("error", "Для Word нужен python-docx:\n  pip install python-docx"))); return
-        if o["diar"]:
+        if any(j.opts.get("diar") for j in jobs) and self._diar_ready():
             try:
                 import pyannote.audio  # noqa
                 import torch  # noqa
@@ -972,11 +1165,14 @@ class App:
                 self._job(job, state="cancel")
                 continue
             pre = f"Файл {i} из {n} · " if n > 1 else ""
-            keys = ["prep"] + (["lang"] if o["multilang"] else []) + ["asr"] + (["diar"] if o["diar"] else []) \
-                + (["sum"] if o["summary"] else [])
-            stage = self._stages(job, keys, pre, o["normalize"])
+            job.locked = True                       # с этого момента настройки файла не меняются
+            jo = self._job_opts(job, o)
+            jo["out"] = self._out_path(job, jo["fmt"], o["all_jobs"])
+            keys = ["prep"] + (["lang"] if jo["multilang"] else []) + ["asr"] + (["diar"] if jo["diar"] else []) \
+                + (["sum"] if jo["summary"] else [])
+            stage = self._stages(job, keys, pre, jo["normalize"])
             try:
-                done.append(self._run_one(job, o, eng, stage, cancel))
+                done.append(self._run_one(job, jo, eng, stage, cancel))
             except Cancelled:
                 cancelled = True
                 self._job(job, state="cancel")
@@ -989,6 +1185,9 @@ class App:
             except Exception as e:
                 failed += 1
                 self._job(job, state="error", error=_first_line(e))
+            finally:
+                job.locked = False
+                self._job(job)                      # панель и карточка: файл снова можно настраивать
 
         if done and not cancelled:
             out, summ, _ = done[0]
@@ -1033,7 +1232,8 @@ class App:
             segments = transcribe_multilang_fast(audio, o["model"], eng, self._prog, lambda m: None, cancel,
                                                  stage=stage)
         else:
-            stage("prep", "проверка языков")
+            # «Авто»: проверка языков (шаг «Подготовка: проверка языков») - внутри transcribe_auto;
+            # язык, выбранный вручную, - сразу распознавание, без проверки
 
             def on_mixed(probe):
                 nonlocal job_mixed
@@ -1043,10 +1243,6 @@ class App:
 
             segments, info = transcribe_auto(audio, o["model"], eng, self._prog, cancel, stage=stage,
                                              forced=o["lang"], on_mixed=on_mixed)
-            other = info.get("forced_other")
-            if other:
-                warn.append(f"В записи есть {LANG_NAME[other]} речь - для смешанной записи выберите "
-                            "«Авто» или «Несколько».")
         del audio
 
         diar_used = False
@@ -1063,7 +1259,7 @@ class App:
                 warn.append(f"Говорящие не определены: {_first_line(e)}")
         self._job(job, segments=segments, diarized=diar_used)
 
-        out = o["outs"][id(job)]
+        out = o["out"]
         stage("save")
         if o["fmt"] == "txt":
             write_txt(segments, out, o["with_ts"], diar_used)

@@ -23,6 +23,11 @@ IS_APPLE_SILICON = IS_MAC and platform.machine() == "arm64"
 FROZEN = bool(getattr(sys, "frozen", False))
 APP = "Scribe"
 
+# Скачивание моделей с Hugging Face - обычным HTTP, без xet: через xet загрузка дважды намертво
+# останавливалась на середине (без ошибки), а HTTP докачивает и падает по таймауту, если сети нет.
+# Задать до первого импорта huggingface_hub (этот модуль импортируется первым).
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 # слова для окна: на Windows и Linux не «Mac» и не «Терминал»
 HERE = "на этом Mac" if IS_MAC else "на этом компьютере"
 SHELL = "в Терминале" if IS_MAC else "в командной строке"

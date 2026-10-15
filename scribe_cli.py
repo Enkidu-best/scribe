@@ -61,8 +61,6 @@ def transcribe_file(path, lang, fmt, out_dir, normalize, model, eng):
         probe = info.pop("probe", {})
         info["probe"] = {k: probe.get(k) for k in ("mixed", "dominant", "confirmed", "confirmed_time",
                                                      "speech_time", "seconds", "method")}
-        if info.get("forced_other"):
-            warn.append(f"в записи есть речь на языке {info['forced_other']} - для смешанной записи выберите auto или multi")
     out = (Path(out_dir) if out_dir else path.parent) / (path.stem + "." + fmt)
     out.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "txt":
