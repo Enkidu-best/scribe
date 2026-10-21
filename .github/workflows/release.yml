@@ -81,12 +81,18 @@ jobs:
           Start-Sleep -Seconds 3
           if (Test-Path C:\ScribeTest\Scribe.exe) { throw "не удалилось" }
           "Тихая установка, расшифровка и удаление прошли" | Tee-Object -Append dist\sizes.txt
+      # место Actions (500 МБ на аккаунт): установщик - в релиз по метке; артефактом - только при ручном запуске, на 1 день
       - uses: actions/upload-artifact@v4
         with:
+          name: Scribe-Report
+          path: dist/sizes.txt
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
           name: Scribe-Setup
-          path: |
-            dist/Scribe-Setup-*.exe
-            dist/sizes.txt
+          path: dist/Scribe-Setup-*.exe
+          retention-days: 1
       - name: В релиз
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
