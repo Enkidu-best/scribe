@@ -26,12 +26,13 @@ OPTIONS = {
     "iconfile": "scribe.icns",
     "includes": ["dictaphone", "dictaphone_worker", "theme", "summary", "multilang", "vad",
                  "engine", "core", "models", "platform_util"],
+    "packages": ["common"],           # общие модули (очередь видеокарты) - с texts.json и VERSION
     "plist": {
         "CFBundleName": "Scribe",
         "CFBundleDisplayName": "Scribe",
         "CFBundleIdentifier": "com.andrey.scribe",
-        "CFBundleShortVersionString": "2.6",
-        "CFBundleVersion": "2.6",
+        "CFBundleShortVersionString": "2.7",
+        "CFBundleVersion": "2.7",
         "NSMicrophoneUsageDescription":
             "Scribe использует микрофон для диктовки речи в текст.",
         "NSHighResolutionCapable": True,

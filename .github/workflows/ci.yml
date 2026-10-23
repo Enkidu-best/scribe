@@ -31,6 +31,8 @@ jobs:
         run: python scribe_cli.py --engine
       - name: Автотесты нарезки
         run: python tests/test_vad.py
+      - name: Очередь видеокарты (общий модуль, временная папка)
+        run: python common/lock/tests/test_heavy_lock.py
       - name: Расшифровка («Авто», английская и смешанная ru/en)
         run: python tests/smoke_cli.py
       - name: Скорость (2 мин, процессор)

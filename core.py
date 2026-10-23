@@ -84,7 +84,7 @@ DIAR_STEPS = {"segmentation": "разбивка на фрагменты", "speak
 FORMATS_AUDIO = "MP3, WAV, M4A, AAC, FLAC, OGG, OPUS, AIFF, WMA, M4B, AMR"
 FORMATS_VIDEO = "MP4, MOV, MKV, WEBM, WMV, AVI, FLV, 3GP, TS, MPG"
 
-APP_VERSION = "2.6"
+APP_VERSION = "2.7"
 CONFIG_PATH = pu.config_path()     # Mac - прежний ~/.audio2text.json; Windows/Linux - папка настроек системы
 # Пробуем модели по порядку: сначала новая community-1 (её тянут свежие версии
 # pyannote и она точнее), затем классическая 3.1 как запасная.
@@ -258,10 +258,67 @@ def write_docx(segments, path, title, with_ts, diarized):
 SR_FAST = 16000
 
 
-def _decode_to_array(path, normalize=True, cancel=None):
+# --- ошибки: по-русски и с действием; исходный текст - в журнал (стандарт 2.3, Scribe 2.7) ---
+_MEM_SIGNS = ("out of memory", "outofmemory", "insufficient memory", "metal::malloc", "kiogpucommandbuffer",
+              "memoryerror", "cannot allocate", "failed to allocate")
+
+
+def heavy_lock_owner():
+    """Кто держит общий замок видеокарты (../.heavy-lock рядом с папкой проекта): «Herald» или None."""
+    try:
+        owner = (pu.source_dir().parent / ".heavy-lock" / "owner").read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not owner or owner.startswith("Scribe"):
+        return None
+    words = owner.split()
+    i = next((k for k, w in enumerate(words) if w[:3] in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")), len(words))
+    return " ".join(words[:i]) or None
+
+
+def is_memory_error(e):
+    t = f"{type(e).__name__} {e}".lower()
+    return isinstance(e, MemoryError) or any(x in t for x in _MEM_SIGNS)
+
+
+def explain_error(e, resume=False):
+    """Текст ошибки для окна: что случилось и что сделать. Английский - только в журнал."""
+    t = str(e)
+    again = "Нажмите «Расшифровать» ещё раз" + (" - продолжу с места остановки." if resume else ".")
+    if "no Stream" in t or "Stream(gpu" in t:
+        return "Сбой движка распознавания. " + again
+    if is_memory_error(e):
+        who = heavy_lock_owner()
+        return ("Не хватило памяти видеокарты." + (f" Сейчас её занимает «{who}»." if who else "")
+                + " Подождите, пока она освободится, и " + again[0].lower() + again[1:])
+    if t.startswith("ffmpeg:"):
+        return "Не удалось прочитать файл - возможно, он повреждён или это не аудио и не видео."
+    if isinstance(e, RuntimeError) and any("а" <= c.lower() <= "я" for c in t[:40]):
+        return t.strip().splitlines()[0]          # наше сообщение - уже по-русски
+    return "Ошибка при обработке файла. " + again + " Подробности - в журнале Scribe."
+
+
+def log_error(e, where=""):
+    """Полный текст и трассировка - в журнал (logs/scribe-errors.log)."""
+    import traceback
+    import time as _t
+    try:
+        d = pu.log_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "scribe-errors.log", "a", encoding="utf-8") as f:
+            f.write(f"\n--- {_t.strftime('%Y-%m-%d %H:%M:%S')} {where}\n")
+            f.write("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+    except Exception:
+        pass
+
+
+def _decode_to_array(path, normalize=True, cancel=None, prog=None, duration=None):
     """ОДИН проход ffmpeg -> float32 моно 16 кГц в память. loudnorm вшит сюда же,
     так что отдельного прохода нормализации не нужно. Читаем по кускам, чтобы
-    «Остановить» прерывал и долгую подготовку звука."""
+    «Остановить» прерывал и долгую подготовку звука.
+    prog(доля) - процент этапа (2.7): ffmpeg отдаёт звук потоком, полученные секунды против
+    длительности файла и есть прогресс. Звук копится в одном bytearray, без лишних копий:
+    на 3-часовой записи это ~690 МБ вместо ~2 ГБ в пике."""
     import numpy as np
     import tempfile
     cmd = ["ffmpeg", "-nostdin", "-i", str(path)]
@@ -269,9 +326,13 @@ def _decode_to_array(path, normalize=True, cancel=None):
         cmd += ["-af", "loudnorm"]
     cmd += ["-ar", str(SR_FAST), "-ac", "1", "-f", "f32le", "-acodec", "pcm_f32le",
             "-hide_banner", "-loglevel", "error", "-"]
+    if prog is not None and not duration:
+        duration = ffprobe_duration(path)
+    total = duration * SR_FAST * 4 if duration else 0
     with tempfile.TemporaryFile() as err:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
-        chunks = []
+        data = bytearray()
+        last = 0.0
         while True:
             if cancel is not None and cancel():
                 proc.kill()
@@ -280,12 +341,18 @@ def _decode_to_array(path, normalize=True, cancel=None):
             buf = proc.stdout.read(1 << 20)
             if not buf:
                 break
-            chunks.append(buf)
+            data += buf
+            if prog is not None and total:
+                f = min(0.99, len(data) / total)
+                if f - last >= 0.01:
+                    last = f
+                    prog(f)
         proc.wait()
         if proc.returncode != 0:
             err.seek(0)
             raise RuntimeError("ffmpeg: " + err.read().decode("utf-8", "ignore")[-300:])
-    return np.frombuffer(b"".join(chunks), dtype=np.float32).copy()
+    n = len(data) // 4 * 4
+    return np.frombuffer(memoryview(data)[:n], dtype=np.float32)
 
 
 def _transcribe_array(eng, audio, model_repo, lang, prog, cancel, initial_prompt=None, temperature=0.0):
@@ -309,7 +376,7 @@ def transcribe_auto(audio, model_repo, eng, prog, cancel, stage=None, forced=Non
         prog(0)
         return _transcribe_array(eng, audio, model_repo, forced, prog, cancel), info
     stage("prep", "проверка языков")
-    probe = multilang.probe_languages(audio, model_repo, cancel)
+    probe = multilang.probe_languages(audio, model_repo, cancel, prog)
     info = dict(probe=probe)
     if probe["mixed"]:
         if on_mixed:

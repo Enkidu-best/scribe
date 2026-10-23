@@ -128,12 +128,14 @@ _SIEVE = {}
 
 
 def _get_sieve():
-    if "lid" not in _SIEVE:
+    eng = engine.get_engine()
+    key = (eng.name, getattr(eng, "device", ""))     # у движка на процессоре - своё сито
+    if key not in _SIEVE:
         try:
-            _SIEVE["lid"] = engine.get_engine().lid(SIEVE_REPO, own=True)
+            _SIEVE[key] = eng.lid(SIEVE_REPO, own=True)
         except Exception:
-            _SIEVE["lid"] = None            # нет сети и модели в кэше - пойдём запасным путём
-    return _SIEVE["lid"]
+            _SIEVE[key] = None            # нет сети и модели в кэше - пойдём запасным путём
+    return _SIEVE[key]
 
 
 def has_language(found, lang):
@@ -165,7 +167,7 @@ def _clip(audio, a, b):
     return audio[int(a * SR):int(b * SR)]
 
 
-def probe_languages(audio, model_repo, cancel=lambda: False):
+def probe_languages(audio, model_repo, cancel=lambda: False, prog=lambda f: None):
     """Дешёвая проверка перед «Авто»: какие языки звучат в записи.
     -> dict(mixed, dominant, other, confirmed{lang: фраз}, confirmed_time{lang: с}, speech_time, seconds, ...)"""
     t0 = time.monotonic()
@@ -175,11 +177,13 @@ def probe_languages(audio, model_repo, cancel=lambda: False):
     speech = sum(b - a for a, b in cands)
     turbo = get_lid(model_repo)
     checked = {}                                         # фраза -> (язык, вероятность) по turbo
+    prog(0.05)
 
     def verify(items):
         items = [c for c in items if c not in checked]
         if items:
             checked.update(zip(items, turbo.top_lang([_clip(audio, a, b) for a, b in items], cancel=cancel)))
+            prog(min(0.95, 0.5 + 0.45 * len(checked) / max(1, min(len(cands), VERIFY_MAX + DOM_SAMPLE))))
 
     # 1) основной язык: если сито уверенно слышит один язык почти во всей речи - берём его,
     #    иначе (например, английский с русским акцентом сито не узнаёт) - turbo по нескольким фразам
@@ -188,6 +192,7 @@ def probe_languages(audio, model_repo, cancel=lambda: False):
     votes = {}
     if sieve is not None:
         P = sieve.lang_probs([_clip(audio, a, b) for a, b in cands], ("ru", "en"), cancel=cancel)
+        prog(0.5)
         for lang, col in (("ru", 0), ("en", 1)):
             t = sum(b - a for (a, b), pr in zip(cands, P) if pr[col] >= 0.5)
             if t >= 0.8 * speech:
@@ -252,6 +257,7 @@ def probe_languages(audio, model_repo, cancel=lambda: False):
                  phrases=len(cands), flagged=len(strong) + len(weak), verified=len(checked), method=method, hits=hits)
     found["mixed"] = bool(other) and has_language(found, other)
     found["seconds"] = round(time.monotonic() - t0, 1)
+    prog(1.0)
     return found
 
 

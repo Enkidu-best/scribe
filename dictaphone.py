@@ -40,6 +40,8 @@ from pathlib import Path
 import platform_util as pu
 import theme as T
 import vad
+from common.lock import heavy_lock as hl                   # очередь видеокарты - общий модуль (стандарт 2.4)
+from common.lock.lock_ui import texts as lt, tk_busy
 
 SR = 16000
 FRAME = vad.CHUNK            # 512 отсчётов = 32 мс - кадр детектора речи
@@ -269,6 +271,16 @@ class DictaphonePage(ctk.CTkFrame):
         self.auto_small = False
         self.on_model_switch = None        # окно: обновить выбор в Настройках и сохранить
         self.small_ok = lambda: True       # окно: Small есть на диске или его можно скачать
+        # замок видеокарты на запись (README модуля, 8.1): «Начать запись» берёт, «Остановить» отдаёт,
+        # «Пауза» дольше 15 мин - отпускает сам, «Продолжить» - берёт снова
+        self.hlock = hl.HeavyLock("Scribe", "диктофон", held_env="SCRIBE_HEAVY_LOCK_HELD",
+                                  path_env="SCRIBE_HEAVY_LOCK")
+        self.cpu_ok = lambda: False        # окно: можно ли на процессоре (четвёртый вариант окна «занята»)
+        self._cpu = False                  # процесс распознавания - на процессоре, модель Small
+        self._gpu_model = model_repo       # модель для видеокарты - вернуться к ней после процессора
+        self._respawn = False              # перезапустить процесс распознавания между фразами
+        self._wait_cancel = None           # ждём очереди видеокарты - отмена
+        self._idle_tick = 0
 
         self._build()
         self.after(100, self._drain_ui)
@@ -321,6 +333,7 @@ class DictaphonePage(ctk.CTkFrame):
                  command=self._fill_mics).pack(side="left")
         self.mic_note = T.label(mrow, "", 12, color=T.FAINT, anchor="w")
         self.mic_note.pack(side="left", padx=(8, 0))
+        self.gpu_note = T.label(ctl, "", 12, color=T.WARN, anchor="w", justify="left", wraplength=760)
 
         box = T.card(self)
         box.pack(fill="both", expand=True, padx=28, pady=12)
@@ -388,7 +401,10 @@ class DictaphonePage(ctk.CTkFrame):
             self._logf = open(LOG_DIR / "dictaphone.log", "a", encoding="utf-8")
         except Exception:
             self._logf = subprocess.DEVNULL
-        self._proc = subprocess.Popen(cmd, stdout=self._logf, stderr=self._logf)
+        env = dict(os.environ)
+        if self._cpu:                                 # видеокарта занята - распознаём на процессоре
+            env.update(SCRIBE_ENGINE="fw", SCRIBE_DEVICE="cpu")
+        self._proc = subprocess.Popen(cmd, stdout=self._logf, stderr=self._logf, env=env)
         self._conn = self._listener.accept()          # ждём подключения воркера
         self._conn.recv()                             # ("ready", None)
 
@@ -438,6 +454,9 @@ class DictaphonePage(ctk.CTkFrame):
         Так подсказка всегда учитывает предыдущую фразу, а при падении воркера ясно,
         какую фразу отправить заново."""
         while self._worker_running:
+            if self._respawn and self._inflight is None:  # видеокарта ↔ процессор - новый процесс
+                self._respawn = False
+                self._kill_worker()
             if self._conn is None:
                 try:
                     self._spawn()
@@ -498,6 +517,7 @@ class DictaphonePage(ctk.CTkFrame):
                 else:
                     self.ui_q.put(("lag", sorted(self._lags)[1]))
             if kind == "text":
+                self.hlock.touch()
                 piece = self._append_piece(val, item.get("speech", 9.0))
                 if piece:
                     self.ui_q.put(("text", piece))
@@ -545,7 +565,10 @@ class DictaphonePage(ctk.CTkFrame):
         return piece
 
     def shutdown(self):
-        """Закрытие приложения: остановить запись и процесс распознавания."""
+        """Закрытие приложения: остановить запись и процесс распознавания, отдать видеокарту."""
+        if self._wait_cancel is not None:
+            self._wait_cancel.set()
+        self.hlock.release()
         try:
             self._mode = "idle"
             if self.rec:
@@ -583,12 +606,69 @@ class DictaphonePage(ctk.CTkFrame):
 
     # ---------- управление записью ----------
     def _toggle_start(self):
-        if self._mode == "idle":
+        if self._wait_cancel is not None:          # ждём очереди видеокарты - кнопка «Отменить ожидание»
+            self._wait_cancel.set()
+        elif self._mode == "idle":
             self._start()
         else:
             self._stop()
 
+    # ---------- видеокарта (стандарт 2.4, 2.5)
+    def _gate(self):
+        """Замок видеокарты перед записью: held / wait / now / cpu, None - «Отмена»."""
+        if self.hlock.held or self.hlock.try_acquire():
+            self._use_gpu()
+            return "held"
+        ans = tk_busy.ask_busy(self.winfo_toplevel(), T, self.hlock.holder(), cpu=self.cpu_ok(),
+                               queue_names=self.hlock.ahead_names())
+        if ans == "now":
+            self.hlock.run_now()
+            self._use_gpu()
+        elif ans == "cpu":
+            self._use_cpu()
+        return ans
+
+    def _use_gpu(self):
+        self._note("")
+        if self._cpu:
+            self._cpu, self.model_repo, self._respawn = False, self._gpu_model, True
+
+    def _use_cpu(self):
+        if not self._cpu:
+            self._gpu_model = self.model_repo
+            self._cpu, self.model_repo, self._respawn = True, "small", True
+            self._model_ready = False
+        self._note("Видеокарта занята - диктофон распознаёт на процессоре (модель Small), до «Остановить».")
+
+    def _note(self, text, color=T.WARN):
+        if text:
+            self.gpu_note.configure(text=text, text_color=color)
+            self.gpu_note.pack(fill="x", padx=14, pady=(0, 10))
+        else:
+            self.gpu_note.pack_forget()
+
+    def _wait_then(self, then):
+        """«Подождать очереди»: ждать замок в фоне; дождались - then(), отменили - как было."""
+        cancel = self._wait_cancel = threading.Event()
+        self.pause_btn.configure(state="disabled")
+        self.start_btn.configure(text=lt.t("cancel_wait"), width=230)
+        T.restyle(self.start_btn, "default", "x")
+        T.set_chip(self.chip, lt.t("chip_waiting"), "warn")
+
+        def run():
+            ok = self.hlock.acquire(cancel=cancel,
+                                    on_wait=lambda h, a: self.ui_q.put(("gpuline", lt.waiting_line(h, a))))
+            self.ui_q.put(("gpuwait_done", (ok, then)))
+        threading.Thread(target=run, daemon=True).start()
+
     def _start(self):
+        mode = self._gate()
+        if mode == "wait":
+            self._wait_then(self._begin)
+        elif mode is not None:
+            self._begin()
+
+    def _begin(self):
         try:
             import sounddevice  # noqa: F401
         except Exception:
@@ -610,13 +690,14 @@ class DictaphonePage(ctk.CTkFrame):
         except Exception as e:
             self._mode = "idle"
             self._reset_buttons()
+            self.hlock.release()
             messagebox.showerror("Микрофон", f"Не удалось открыть микрофон:\n{e}\n\n"
                                  "Проверьте доступ к микрофону: Системные настройки → "
                                  "Конфиденциальность и безопасность → Микрофон.")
             return
 
     def _reset_buttons(self):
-        self.start_btn.configure(text="Начать запись")
+        self.start_btn.configure(text="Начать запись", width=170)
         T.restyle(self.start_btn, "primary", "mic")
         self.pause_btn.configure(state="disabled", text="Пауза", image=T.icon("pause"))
 
@@ -627,6 +708,16 @@ class DictaphonePage(ctk.CTkFrame):
         self._reset_buttons()
         self.level.set(0)
         self._status("stopped")
+        self._note("")
+        # последняя фраза ещё распознаётся - отдаём видеокарту, когда она придёт (или через 20 с)
+        threading.Thread(target=self._release_after_tail, daemon=True).start()
+
+    def _release_after_tail(self):
+        end = time.monotonic() + 20
+        while time.monotonic() < end and (self._inflight is not None or not self.phrase_q.empty()):
+            time.sleep(0.2)
+        if self._mode == "idle" and self._wait_cancel is None:
+            self.hlock.release()
 
     def _toggle_pause(self):
         if self._mode == "recording":
@@ -634,10 +725,27 @@ class DictaphonePage(ctk.CTkFrame):
             self.rec.flush_now()           # закрыть текущую фразу сразу
             self.pause_btn.configure(text="Продолжить", image=T.icon("play"))
             self._status("paused")
+            self.hlock.touch()             # с этой минуты считается простой (15 мин - отпустить видеокарту)
         elif self._mode == "paused":
-            self._mode = "recording"; self.rec.paused = False
-            self.pause_btn.configure(text="Пауза", image=T.icon("pause"))
-            self._status("listen")
+            if self.hlock.idle_released:   # на паузе видеокарту отпустили - взять снова (или окно «занята»)
+                mode = self._gate()
+                if mode == "wait":
+                    self._wait_then(self._resume)
+                    return
+                if mode is None:
+                    return
+                self.hlock.idle_released = False
+            self._resume()
+
+    def _resume(self):
+        self._note("")
+        self._reset_buttons()
+        self.start_btn.configure(text="Остановить")
+        T.restyle(self.start_btn, "danger", "square")
+        self._mode = "recording"; self.rec.paused = False
+        self.pause_btn.configure(state="normal", text="Пауза", image=T.icon("pause"))
+        self._status("listen")
+        self.hlock.touch()
 
     # ---------- обновление UI ----------
     def _drain_ui(self):
@@ -674,6 +782,25 @@ class DictaphonePage(ctk.CTkFrame):
                                           "(быстрее). Вернуть - в Настройках", "warn")
                     if self.on_model_switch:
                         self.on_model_switch("small")
+                elif kind == "gpuline":
+                    self._note(val)
+                elif kind == "gpuwait_done":
+                    ok, then = val
+                    self._wait_cancel = None
+                    self._note("")
+                    if ok:
+                        self.hlock.idle_released = False
+                        self._use_gpu()
+                        then()
+                    elif self._mode == "paused":
+                        self._reset_buttons()
+                        self.start_btn.configure(text="Остановить")
+                        T.restyle(self.start_btn, "danger", "square")
+                        self.pause_btn.configure(state="normal", text="Продолжить", image=T.icon("play"))
+                        self._status("paused")
+                    else:
+                        self._reset_buttons()
+                        self._status("ready" if self._model_ready else "stopped")
                 elif kind == "lag":
                     if time.monotonic() - self._lag_shown > 30:
                         self._lag_shown = time.monotonic()
@@ -681,6 +808,9 @@ class DictaphonePage(ctk.CTkFrame):
                                               "выбрать модель поменьше", "warn")
         except queue.Empty:
             pass
+        self._idle_tick += 1
+        if self._idle_tick % 50 == 0 and self._mode == "paused" and self.hlock.idle_check():
+            self._note(lt.t("idle_released"), T.MUTED)      # простой на паузе 15 мин (стандарт 2.5)
         self.after(100, self._drain_ui)
 
     def _count_words(self):

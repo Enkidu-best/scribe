@@ -67,6 +67,8 @@ except Exception:
 import theme as T
 import summary
 from summary import Cancelled
+from common.lock import heavy_lock as hl                   # очередь видеокарты - общий модуль (стандарт 2.4)
+from common.lock.lock_ui import texts as lt, tk_busy
 
 HAS_DND = False
 try:
@@ -93,7 +95,7 @@ from core import (  # noqa: F401 - всё ядро доступно и как wh
     group_by_speaker, _tmp_for, write_txt, write_srt, write_docx, SR_FAST,
     _decode_to_array, _transcribe_array, transcribe_auto, transcribe_multilang_fast, _PIPELINES, _load_pipeline,
     _mk_hook, _extract_turns, diarize_and_label, free_asr_models, read_transcript, ollama_installed,
-    _fmt_dur, _fmt_size, _short)
+    _fmt_dur, _fmt_size, _short, explain_error, log_error, is_memory_error)
 
 # ---------------------------------------------------------------------------
 # Интерфейс
@@ -107,12 +109,13 @@ class Job:
         self.path = path
         self.opts = dict(opts or {})
         self.locked = False        # файл взят в работу - его настройки больше не меняются
+        self.cpu = False           # видеокарте не хватило памяти - этот файл распознаётся на процессоре (2.7)
         try:
             self.size = path.stat().st_size
         except OSError:
             self.size = 0
         self.duration = 0.0
-        self.state = "queue"       # queue / run / done / error / cancel
+        self.state = "queue"       # queue (не начат) / sched (в очереди Scribe) / run / done / error / cancel
         self.stage = ""
         self.out = None
         self.summary = None
@@ -170,7 +173,9 @@ class FileRow(ctk.CTkFrame):
                             _fmt_size(j.size) if j.size else "", j.path.parent.name,
                             (f"≈ {max(10, round(est / 10) * 10)} с" if est < 90 else f"≈ {round(est / 60)} мин") + " на этом компьютере" if est else "") if x]
         self.meta.configure(text="  ·  ".join(meta))
-        kind, text = {"queue": ("neutral", "Ждёт"), "sched": ("neutral", "В очереди"), "run": ("acc", j.stage or "Идёт…"),
+        # «Ждёт» - только очередь видеокарты (стандарт 2.1, Scribe 06 Г); не запущенный файл - «Не начат»
+        sched = ("warn", lt.t("chip_waiting")) if self.app.gpu_waiting else ("neutral", "В очереди")
+        kind, text = {"queue": ("neutral", "Не начат"), "sched": sched, "run": ("acc", j.stage or "Идёт…"),
                       "done": ("ok", "Готово"), "error": ("bad", "Ошибка"),
                       "cancel": ("warn", "Остановлено")}[j.state]
         T.set_chip(self.chip, text, kind)
@@ -342,6 +347,14 @@ class App:
         self.start_time = None
         self.cur_job = None
         self.stage_text = ""
+        # замок видеокарты на проход очереди файлов и «Подвести итоги» (README модуля, 8.1); простоя нет -
+        # замок держится только пока идёт работа. gpu_mode: held - наш, wait - ждём очереди, now - поверх чужого
+        self.hlock = hl.HeavyLock("Scribe", "расшифровка", held_env="SCRIBE_HEAVY_LOCK_HELD",
+                                  path_env="SCRIBE_HEAVY_LOCK", idle_after=None)
+        self.gpu_mode = "held"
+        self.gpu_waiting = False
+        self.models_missing = False
+        self._cpu_dict = None             # можно ли диктофону на процессоре (faster-whisper + Small на диске)
         self.dict_page = None
         self.page = None
         self.sel = []                   # выделенные файлы: панель справа показывает и меняет их настройки
@@ -477,7 +490,9 @@ class App:
         self._dict_auto()
         for j in self.jobs:
             j.row.refresh()
-        if any(not it["local"] and not it["optional"] for it in items):
+        self.models_missing = any(not it["local"] and not it["optional"] for it in items)
+        self._gpu_tick()
+        if self.models_missing:
             self.open_models(items)
 
     def open_models(self, items=None):
@@ -490,6 +505,7 @@ class App:
         self._models_win = ModelsWindow(self.root, self, items)
 
     def after_models_changed(self):
+        self.models_missing = False
         self._sync_opts()
 
     def _pyannote_local(self):
@@ -534,6 +550,7 @@ class App:
             self.dict_page = DictaphonePage(self.content, model, self.cfg)
             self.dict_page.on_model_switch = self._dict_switched
             self.dict_page.small_ok = self._small_ok
+            self.dict_page.cpu_ok = self._cpu_ok
             self._dict_auto()
             self.pages["dict"] = self.dict_page
 
@@ -558,7 +575,10 @@ class App:
 
         head = ctk.CTkFrame(page, fg_color="transparent")
         head.grid(row=0, column=0, columnspan=2, sticky="ew", padx=28, pady=(22, 14))
-        T.label(head, "Расшифровка", 22, bold=True, anchor="w").pack(fill="x")
+        top = ctk.CTkFrame(head, fg_color="transparent")
+        top.pack(fill="x")
+        T.label(top, "Расшифровка", 22, bold=True, anchor="w").pack(side="left")
+        self.gpu_chip = T.chip(top)              # состояние модели и видеокарты (стандарт 2.1) - после проверки движка
         T.label(head, f"Аудио и видео → текст. Всё распознаётся {pu.HERE}; результат сохраняется "
                       "рядом с исходным файлом.", 13, color=T.MUTED, anchor="w").pack(fill="x", pady=(2, 0))
 
@@ -576,8 +596,7 @@ class App:
         # --- низ: прогресс и запуск ---
         bar = ctk.CTkFrame(page, fg_color="transparent")
         bar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=28, pady=(14, 20))
-        left = ctk.CTkFrame(bar, fg_color="transparent")
-        left.pack(side="left", fill="x", expand=True, padx=(0, 18))
+        left = ctk.CTkFrame(bar, fg_color="transparent")      # раскладка - после кнопок: им место первыми
         prow = ctk.CTkFrame(left, fg_color="transparent")
         prow.pack(fill="x")
         self.progress = ctk.CTkProgressBar(prow, height=6)
@@ -585,8 +604,7 @@ class App:
         self.progress.pack(side="left", fill="x", expand=True, pady=(4, 0))
         self.timer = T.label(prow, "00:00", 13, color=T.MUTED, width=54, anchor="e")
         self.timer.pack(side="right", padx=(10, 0))
-        self.status = T.label(left, "Добавьте файлы, выберите нужные - и нажмите «Расшифровать».", 13, color=T.MUTED,
-                              anchor="w")
+        self.status = T.label(left, self.HINT_START, 13, color=T.MUTED, anchor="w")
         self.status.pack(fill="x", pady=(4, 0))
         # главная кнопка - выделенные файлы; рядом спокойная «Все файлы (N)» (во время работы - «Остановить»)
         self.run_btn = T.button(bar, "Выберите файл в списке", "play", kind="primary", width=300, height=42,
@@ -595,6 +613,10 @@ class App:
         self.all_btn = T.button(bar, "Все файлы", "files", width=170, height=42, size=14,
                                 command=self._all_or_stop)
         self.all_btn.pack(side="right", padx=(0, 10))
+        # строка состояния - в оставшееся место, длинная («Жду видеокарту: …») переносится, а не теснит кнопки
+        left.pack(side="left", fill="x", expand=True, padx=(0, 18))
+        left.bind("<Configure>", lambda e: self.status.configure(wraplength=max(200, e.width - 4)))
+        self.status.configure(justify="left")
         self._refresh_files()
         self._refresh_run_buttons()
         return page
@@ -776,6 +798,8 @@ class App:
             parts.append("таймкоды")
         if o["summary"] and ollama_installed():
             parts.append("итоги")
+        if job.cpu:
+            parts.append("на процессоре")
         return "  ·  ".join(parts)
 
     def _editable(self, job):
@@ -809,6 +833,21 @@ class App:
                 j.row.refresh()
         self._panel_load()
         self._refresh_run_buttons()
+        self._hint_select()
+
+    HINT_START = "Добавьте файлы, выберите нужные - и нажмите «Расшифровать»."
+    HINT_SELECT = "Щёлкните файл в списке или нажмите «Все файлы»."
+
+    def _hint_select(self):
+        """Scribe 06 Г3: файлы есть, но ни один не выделен - подсказка, почему кнопка серая."""
+        if self.running:
+            return
+        cur = self.status.cget("text")
+        if self._waiting() and not self._sel_targets():
+            if cur in ("", self.HINT_START):
+                self._set_status(self.HINT_SELECT)
+        elif cur == self.HINT_SELECT:
+            self._set_status(self.HINT_START)
 
     def _select_all(self, event=None):
         """Cmd/Ctrl+A - выделить все файлы (в поле ввода - как обычно, выделить текст)."""
@@ -913,7 +952,6 @@ class App:
             elif path.suffix.lower() in AUDIO_EXTS or path.suffix.lower() in TEXT_EXTS:
                 found.append(path)
         have = {j.path for j in self.jobs}
-        was_empty = not self.jobs
         new = []
         for path in found:
             if path not in have:
@@ -929,13 +967,14 @@ class App:
         self._refresh_files()
         audio = [j for j in new if j.kind == "audio"]
         if audio:
-            # новые файлы не выделяются (2.6): «Расшифровать» работает только с выделенными. Исключение -
-            # в пустой список добавлен ровно один файл: он выделен, и его можно сразу расшифровать
-            if was_empty and len(new) == 1:
+            # новые файлы не выделяются (2.6): «Расшифровать» работает только с выделенными. Исключение
+            # (Scribe 06 Г): добавлен один файл - он выделяется сам, кнопка сразу «Расшифровать: <файл>»
+            if len(audio) == 1 and not self.running:
                 self.sel, self.anchor = list(audio), audio[0]
                 self._after_select()
             threading.Thread(target=self._probe, args=(audio,), daemon=True).start()
         self._refresh_run_buttons()
+        self._hint_select()
 
     def _probe(self, jobs):
         for j in jobs:
@@ -970,6 +1009,7 @@ class App:
             self._panel_load()
         self._refresh_files()
         self._refresh_run_buttons()
+        self._hint_select()
 
     def clear_files(self):
         if self.running:
@@ -982,7 +1022,7 @@ class App:
         self._refresh_files()
         self._refresh_run_buttons()
         self.progress.set(0)
-        self._set_status("Добавьте файлы, выберите нужные - и нажмите «Расшифровать».")
+        self._set_status(self.HINT_START)
 
     # ---------- статус/таймер ----------
     def _stat(self, m): self.q.put(("status", m))
@@ -1004,6 +1044,17 @@ class App:
         go.keys = keys
         return go
 
+    def _eta(self, v):
+        """« · осталось ~4 мин» - по скорости текущего этапа (стандарт 2.2)."""
+        t0 = getattr(self, "_stage_t0", None)
+        if not t0 or v < 0.05 or v >= 0.995:
+            return ""
+        el = time.monotonic() - t0
+        if el < 5:
+            return ""
+        rem = el * (1 - v) / v
+        return f"  ·  осталось ~{max(1, round(rem / 60))} мин" if rem >= 60 else f"  ·  осталось ~{max(5, round(rem / 5) * 5)} с"
+
     def _set_status(self, text, color=T.MUTED):
         self.status.configure(text=text, text_color=color)
 
@@ -1011,7 +1062,22 @@ class App:
         if self.running and self.start_time:
             el = int(time.monotonic() - self.start_time)
             self.timer.configure(text=f"{el // 60:02d}:{el % 60:02d}")
+        self._ticks = getattr(self, "_ticks", 0) + 1
+        if self._ticks % 4 == 0:
+            self._gpu_tick()
         self.root.after(500, self._tick)
+
+    def _gpu_tick(self):
+        """Строка состояния в шапке (стандарт 2.1): готова / работает / занята «…» [- в очереди] / нет модели."""
+        if self.eng is None:
+            return
+        dict_lock = getattr(self.dict_page, "hlock", None)
+        working = (self.running and not self.gpu_waiting) or bool(dict_lock and (dict_lock.held or dict_lock.now))
+        lock = dict_lock if (dict_lock and dict_lock.now and not self.running) else self.hlock
+        _, text, kind = lt.header_state(lock, model_ok=not self.models_missing, working=working and not lock.now)
+        T.set_chip(self.gpu_chip, "Модель: " + text, kind)
+        if not self.gpu_chip.winfo_ismapped():
+            self.gpu_chip.pack(side="right")
 
     def _drain(self):
         try:
@@ -1023,6 +1089,8 @@ class App:
                         self._set_status(msg[1])
                 elif kind == "stage":
                     _, job, chip, text = msg
+                    if text.split(":")[0] != getattr(self, "_stage_base", None):   # новый этап - часы этапа
+                        self._stage_base, self._stage_t0 = text.split(":")[0], time.monotonic()
                     job.stage = chip
                     self.cur_job = job
                     self.stage_text = text
@@ -1042,7 +1110,8 @@ class App:
                     if j is not None and j.state == "run":
                         T.set_chip(j.row.chip, f"{j.stage} · {int(v * 100)} %" if v >= 0 else j.stage, "acc")
                         if self.stage_text and not self.cancel_evt.is_set():
-                            self._set_status(f"{self.stage_text} - {int(v * 100)} %" if v >= 0 else self.stage_text)
+                            self._set_status(f"{self.stage_text} - {int(v * 100)} %{self._eta(v)}" if v >= 0
+                                             else self.stage_text)
                 elif kind == "job":
                     _, job, upd = msg
                     for k, v in upd.items():
@@ -1055,12 +1124,23 @@ class App:
                         self._panel_load()
                     if "state" in upd:
                         self._refresh_run_buttons()
+                elif kind == "gpuwait":                  # встали в очередь видеокарты / дождались
+                    self.gpu_waiting = msg[1]
+                    for j in self.jobs:
+                        j.row.refresh()
+                    self._refresh_run_buttons()
+                    self._gpu_tick()
+                elif kind == "gpuline":
+                    if not self.cancel_evt.is_set():
+                        self._set_status(lt.waiting_line(msg[1], msg[2]), T.WARN)
                 elif kind == "token":
                     self._token_result(*msg[1])
                 elif kind == "engine":
                     self._engine_ready(*msg[1])
                 elif kind == "ollama":
                     self._ollama_result(*msg[1])
+                elif kind == "oom":
+                    self.root.after(300, lambda j=msg[1]: self._ask_oom(j))
                 elif kind == "done":
                     self._finish(msg[1], msg[2] if len(msg) > 2 else None)
         except queue.Empty:
@@ -1103,7 +1183,8 @@ class App:
             if self.cancel_evt.is_set():
                 self.all_btn.configure(state="disabled", text="Останавливаю…")
             else:
-                self.all_btn.configure(state="normal", text="Остановить")
+                self.all_btn.configure(state="normal", text=lt.t("cancel_wait") if self.gpu_waiting else "Остановить",
+                                       width=230 if self.gpu_waiting else 170)   # «Отменить ожидание» не обрезана
             T.restyle(self.all_btn, "danger", "square")
             return
         if t:
@@ -1113,7 +1194,8 @@ class App:
             self.run_btn.configure(state="disabled", text="Выберите файл в списке")
         T.restyle(self.run_btn, "primary", "play")
         n = len(self._waiting())
-        self.all_btn.configure(state="normal" if n else "disabled", text=f"Все файлы ({n})" if n else "Все файлы")
+        self.all_btn.configure(state="normal" if n else "disabled", text=f"Все файлы ({n})" if n else "Все файлы",
+                               width=170)
         T.restyle(self.all_btn, "default", "files")
 
     def start(self):
@@ -1134,7 +1216,7 @@ class App:
             self.start_all()
 
     def start_all(self):
-        """«Все файлы (N)»: вся очередь «Ждёт» - после подтверждения."""
+        """«Все файлы (N)»: все не начатые файлы - после подтверждения."""
         waiting = self._waiting()
         if not waiting:
             return
@@ -1148,32 +1230,41 @@ class App:
         if not self.running:
             return
         self.cancel_evt.set()
-        self._set_status("Останавливаю - дождусь ближайшей точки остановки…", T.WARN)
+        self._set_status("Отменяю ожидание видеокарты…" if self.gpu_waiting
+                         else "Останавливаю - дождусь ближайшей точки остановки…", T.WARN)
         self._refresh_run_buttons()
 
     def _confirm(self, title, text, yes, no):
         """Вопрос с понятными кнопками («Расшифровать все» / «Отмена»), а не «Да / Нет»."""
+        return self._choose(title, text, [("ok", yes, "primary", "play"), (None, no, "ghost", None)]) == "ok"
+
+    def _choose(self, title, text, options):
+        """Окно программы с несколькими вариантами (стандарт 3.6): options - [(ключ, надпись, вид, значок)],
+        первый - главный (Enter), Esc и крестик - «Отмена» (None)."""
         dlg = ctk.CTkToplevel(self.root)
         dlg.title(title)
         dlg.resizable(False, False)
         dlg.transient(self.root)
-        res = {"ok": False}
+        res = {"ans": None}
         wrap = ctk.CTkFrame(dlg, fg_color="transparent")
         wrap.pack(fill="both", expand=True, padx=24, pady=20)
-        T.label(wrap, text, 14, anchor="w", justify="left", wraplength=380).pack(fill="x")
+        T.label(wrap, text, 14, anchor="w", justify="left", wraplength=420).pack(fill="x")
         btns = ctk.CTkFrame(wrap, fg_color="transparent")
         btns.pack(fill="x", pady=(18, 0))
 
-        def close(ok):
-            res["ok"] = ok
+        def close(ans):
+            res["ans"] = ans
             dlg.destroy()
-        self._confirm_buttons = (T.button(btns, yes, "play", kind="primary", width=180, command=lambda: close(True)),
-                                 T.button(btns, no, kind="ghost", width=100, command=lambda: close(False)))
-        self._confirm_buttons[0].pack(side="right")
-        self._confirm_buttons[1].pack(side="right", padx=(0, 8))
-        dlg.bind("<Return>", lambda e: close(True))
-        dlg.bind("<Escape>", lambda e: close(False))
-        dlg.protocol("WM_DELETE_WINDOW", lambda: close(False))
+        self._confirm_buttons = []
+        for key, label, kind, icon in options:
+            b = T.button(btns, label, icon, kind=kind, width=max(100, 11 * len(label) + 40),
+                         command=lambda k=key: close(k))
+            self._confirm_buttons.append(b)
+        for b in self._confirm_buttons:          # главный - справа, остальные левее
+            b.pack(side="right", padx=(8, 0))
+        dlg.bind("<Return>", lambda e: close(options[0][0]))
+        dlg.bind("<Escape>", lambda e: close(None))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: close(None))
         self._confirm_dlg = dlg
         dlg.update_idletasks()                  # по центру окна Scribe
         w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
@@ -1183,11 +1274,63 @@ class App:
         dlg.after(50, lambda: (dlg.lift(), dlg.focus_force(), dlg.grab_set()))
         self.root.wait_window(dlg)
         self._confirm_dlg = None
-        return res["ok"]
+        return res["ans"]
+
+    def _ask_oom(self, job):
+        """Видеокарте не хватило памяти (стандарт 2.3): подождать или распознать на процессоре."""
+        import engine
+        from core import heavy_lock_owner
+        who = heavy_lock_owner()
+        try:
+            local = engine.cpu_engine().is_local(self.cfg.get("model_repo", MODEL_REPO))
+        except Exception:
+            local = False
+        text = (f"Не хватило памяти видеокарты для «{_short(job.path.name, 40)}»."
+                + (f" Сейчас её занимает «{who}»." if who else "")
+                + " Подождать, пока она освободится, или распознать на процессоре?\n\n"
+                + "На процессоре - в несколько раз медленнее"
+                + ("." if local else ", и в первый раз скачается модель ≈ 1,6 ГБ."))
+        ans = self._choose("Не хватило памяти видеокарты", text,
+                           [("wait", "Подождать очереди", "primary", "pause"),
+                            ("cpu", "На процессоре", "default", None), (None, "Отмена", "ghost", None)])
+        if job not in self.jobs or job.row is None or not job.row.winfo_exists():
+            return                                  # файл убрали из списка, пока окно было открыто
+        if ans in ("wait", "cpu"):
+            job.cpu = ans == "cpu"
+            job.state, job.error = "queue", ""
+            self._enqueue([job])
+
+    def _gpu_gate(self, what):
+        """Перед тяжёлой работой - замок видеокарты (стандарт 2.4). held - взят, wait - «Подождать очереди»,
+        now - «Запустить сейчас», None - «Отмена»."""
+        if self.hlock.held or self.hlock.try_acquire():
+            self.hlock.set_what(what)
+            return "held"
+        self.hlock.what = what
+        ans = tk_busy.ask_busy(self.root, T, self.hlock.holder(), queue_names=self.hlock.ahead_names())
+        if ans == "now":
+            self.hlock.run_now()
+        return ans
+
+    def _gpu_wait(self):
+        """В обработчике: «Подождать очереди» - ждать замок (с «Отменить ожидание»). False - отменили."""
+        if self.gpu_mode != "wait":
+            return True
+        self.q.put(("gpuwait", True))
+        ok = self.hlock.acquire(cancel=self.cancel_evt, on_wait=lambda h, a: self.q.put(("gpuline", h, a)))
+        self.q.put(("gpuwait", False))
+        return ok
 
     def _enqueue(self, jobs):
         """Поставить файлы в обработку. Обработчик берёт их по одному; если он уже работает -
-        файлы встанут в конец очереди."""
+        файлы встанут в конец очереди. Новый обработчик - только после замка видеокарты."""
+        with self.qlock:
+            need_gate = not self.worker_alive
+        if need_gate:
+            mode = self._gpu_gate("расшифровка")
+            if mode is None:
+                return
+            self.gpu_mode = mode
         self._save_prefs()
         for j in jobs:
             j.state, j.error, j.warn, j.stage, j.out, j.summary, j.info = "sched", "", "", "", None, None, ""
@@ -1200,6 +1343,18 @@ class App:
                 self.worker_alive = True
                 self.gen += 1
                 gen = self.gen
+        if spawn and not need_gate:               # обработчик закончил, пока ставили файлы - замок заново
+            mode = self._gpu_gate("расшифровка")
+            if mode is None:
+                with self.qlock:
+                    self.run_queue = [j for j in self.run_queue if j not in jobs]
+                    self.worker_alive = False
+                for j in jobs:
+                    j.state = "queue"
+                    j.row.refresh()
+                self._refresh_run_buttons()
+                return
+            self.gpu_mode = mode
         if not self.running:
             self.mode = "asr"
             self._begin_run()
@@ -1251,6 +1406,10 @@ class App:
             self.explain_ollama()
             return
         opts = dict(sum_model=self.cfg.get("summary_model", summary.DEFAULT_MODEL))
+        mode = self._gpu_gate(f"итоги «{job.path.name}»")
+        if mode is None:
+            return
+        self.gpu_mode = mode
         job.state, job.warn, job.error = "run", "", ""
         self.mode = "sum"
         self._begin_run()
@@ -1261,6 +1420,8 @@ class App:
         stage = self._stages(job, ["sum"])
         self.q.put(("stage", job, STEP_CHIP["sum"], "Шаг 1 из 1 · Итоги"))
         try:
+            if not self._gpu_wait():
+                raise Cancelled()
             if job.segments:
                 text = summary.transcript_text(job.segments, job.diarized)
             else:
@@ -1275,21 +1436,28 @@ class App:
         except Exception as e:
             self._job(job, state="done", warn=f"Итоги не сделаны: {_first_line(e)}")
             self.q.put(("done", ("warn", "Итоги не сделаны - причина под файлом в списке.")))
+        finally:
+            self.hlock.release()
 
     def _worker(self, gen):
         """Обработчик очереди: берёт поставленные файлы по одному, пока очередь не опустеет.
         Настройки файла читаются в момент, когда он берётся в работу."""
         cancel = self.cancel_evt.is_set
 
-        def give_back():                        # не начатые файлы - обратно в «Ждёт»
+        def give_back():                        # не начатые файлы - обратно в «Не начат», замок - отдать
             with self.qlock:
                 rest = list(self.run_queue)
                 self.run_queue.clear()
                 self.worker_alive = False
+                self.hlock.release()
             for j in rest:
                 self._job(j, state="queue")
             return rest
 
+        if not self._gpu_wait():
+            give_back()
+            self.q.put(("done", ("warn", "Ожидание видеокарты отменено."), gen))
+            return
         try:
             self._stat("Загружаю модель…")
             import engine
@@ -1305,7 +1473,8 @@ class App:
                 if cancel():
                     break
                 if not self.run_queue:              # очередь пуста - заканчиваем; новые файлы после
-                    self.worker_alive = False       # этой строки запустят новый обработчик
+                    self.worker_alive = False       # этой строки запустят новый обработчик (и возьмут замок)
+                    self.hlock.release()
                     break
                 job = self.run_queue.pop(0)
                 left = len(self.run_queue)
@@ -1313,6 +1482,7 @@ class App:
             n = i + left
             pre = f"Файл {i} из {n} · " if n > 1 else ""
             job.locked = True                       # с этого момента настройки файла не меняются
+            self.hlock.set_what(f"расшифровка «{_short(job.path.name, 40)}»")
             base = dict(model=self.cfg.get("model_repo", MODEL_REPO), token=self.cfg.get("hf_token", ""),
                         normalize=self.cfg.get("normalize", True),
                         sum_model=self.cfg.get("summary_model", summary.DEFAULT_MODEL))
@@ -1327,7 +1497,9 @@ class App:
                         import docx  # noqa
                     except Exception:
                         raise RuntimeError("Для Word нужен python-docx: pip install python-docx")
-                done.append(self._run_one(job, jo, eng, stage, cancel))
+                eng_j = engine.cpu_engine() if job.cpu else eng     # «На процессоре» - только этот файл
+                with engine.using(eng_j):
+                    done.append(self._run_one(job, jo, eng_j, stage, cancel))
             except Cancelled:
                 cancelled = True
                 self._job(job, state="cancel")
@@ -1338,11 +1510,16 @@ class App:
                     give_back()
                     self.q.put(("done", ("error", pu.FFMPEG_HINT), gen)); return
                 failed += 1
-                self._job(job, state="error", error=_first_line(e))
+                log_error(e, f"расшифровка {job.path.name}")
+                self._job(job, state="error", error=explain_error(e))
             except Exception as e:
                 failed += 1
-                self._job(job, state="error", error=_first_line(e))
+                log_error(e, f"расшифровка {job.path.name}")
+                self._job(job, state="error", error=explain_error(e))
+                if is_memory_error(e) and not job.cpu:
+                    self.q.put(("oom", job))        # окно: подождать или на процессоре
             finally:
+                job.cpu = False
                 job.locked = False
                 self._job(job)                      # панель и карточка: файл снова можно настраивать
         if cancel():
@@ -1373,14 +1550,14 @@ class App:
             raise RuntimeError("Файл не найден - его переместили или удалили.")
         self._job(job, state="run")
         stage("prep")
-        self._prog(-1)
+        self._prog(0)
         warn = []
         try:
-            audio = _decode_to_array(path, o["normalize"], cancel)
+            audio = _decode_to_array(path, o["normalize"], cancel, self._prog, job.duration)
         except RuntimeError:
             if not o["normalize"]:
                 raise
-            audio = _decode_to_array(path, False, cancel)
+            audio = _decode_to_array(path, False, cancel, self._prog, job.duration)
             warn.append("Нормализация не удалась - обработано как есть.")
         if not len(audio):
             raise RuntimeError("В файле не найден звук.")
@@ -1474,13 +1651,15 @@ class App:
         self.add_btn.configure(state="normal")
         self.nav["files"].configure(text="Расшифровка")
         for j in self.jobs:
-            if j.state == "sched":                  # не дошла очередь - снова «Ждёт»
+            if j.state == "sched":                  # не дошла очередь - снова «Не начат»
                 j.state = "queue"
             elif j.state == "run":
                 j.state = "done" if j.kind == "text" else "cancel"
             j.row.refresh()
+        self.gpu_waiting = False
         self._refresh_files()
         self._refresh_run_buttons()
+        self._gpu_tick()
         if self.sel:
             self._panel_load()
         el = int(time.monotonic() - self.start_time) if self.start_time else 0
@@ -1639,6 +1818,23 @@ class App:
         if page is not None and self.eng is not None:
             page.auto_small = getattr(self.eng, "device", "") == "cpu" and not self.cfg.get("dict_model")
 
+    def _cpu_ok(self):
+        """Четвёртый вариант окна «Видеокарта занята» для диктофона: на процессоре, если это быстро -
+        faster-whisper и модель Small на диске (замер на M4: фраза 4 с - 1,0 с)."""
+        if self._cpu_dict is None:
+            import importlib.util
+            ok = False
+            try:
+                import engine
+                import models
+                ok = (self.eng is not None and getattr(self.eng, "device", "") != "cpu"
+                      and importlib.util.find_spec("faster_whisper") is not None
+                      and models.is_local(engine.MODELS["small"][1]))
+            except Exception:
+                ok = False
+            self._cpu_dict = ok
+        return self._cpu_dict
+
     def _small_ok(self):
         import models
         return self.eng is not None and (self.eng.is_local("small") or models.online())
@@ -1786,6 +1982,7 @@ class App:
             return
         self.cancel_evt.set()
         self._save_prefs()
+        self.hlock.release()
         if self.dict_page is not None:
             self.dict_page.shutdown()
         self.root.destroy()

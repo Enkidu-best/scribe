@@ -14,6 +14,7 @@ Scribe без окна: расшифровка из командной стро�
 """
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -113,17 +114,38 @@ def main(argv=None):
         return 2
     model = engine.MODELS[engine.model_key(a.model)][0] if engine.model_key(a.model) in engine.MODELS else a.model
     _say(f"Scribe {core.APP_VERSION} · {engine.engine_info()} · режим {a.lang}")
+    # очередь видеокарты (стандарт 2.4): командная строка - фоновый прогон, ждёт молча и уступает человеку
+    # между файлами (контрольная точка); HEAVY_LOCK_WHO=human - если запускает сам Андрей
+    from common.lock import heavy_lock as hl
+    who = os.environ.get("HEAVY_LOCK_WHO") if os.environ.get("HEAVY_LOCK_WHO") in (hl.HUMAN, hl.BACKGROUND) \
+        else hl.BACKGROUND
+    lock = hl.HeavyLock("Scribe (командная строка)", "расшифровка", who=who, held_env="SCRIBE_HEAVY_LOCK_HELD",
+                        path_env="SCRIBE_HEAVY_LOCK", idle_after=None)
+    shown = {"t": 0.0}
+
+    def waiting(h, ahead):
+        if time.time() - shown["t"] >= 60:
+            shown["t"] = time.time()
+            _say(f"жду видеокарту: «{h.program}», с {h.since_text}" if h else "жду видеокарту: перед нами очередь")
+
+    lock.acquire(on_wait=waiting, poll=2)
     report, code = [], 0
-    for f in a.files:
-        path = Path(f).expanduser()
-        try:
-            r = transcribe_file(path, a.lang, a.fmt, a.out, not a.no_normalize, model, eng)
-            _say(f"готово: {path.name} → {Path(r['out']).name} · {r['seconds']} с на {r['duration']} с звука"
-                 + (f" · {', '.join(r['warnings'])}" if r["warnings"] else ""))
-        except Exception as e:
-            r, code = dict(file=str(path), error=str(e)), 1
-            _say(f"ошибка: {path.name}: {e}")
-        report.append(r)
+    try:
+        for f in a.files:
+            path = Path(f).expanduser()
+            lock.set_what(f"расшифровка «{path.name}»")
+            try:
+                r = transcribe_file(path, a.lang, a.fmt, a.out, not a.no_normalize, model, eng)
+                _say(f"готово: {path.name} → {Path(r['out']).name} · {r['seconds']} с на {r['duration']} с звука"
+                     + (f" · {', '.join(r['warnings'])}" if r["warnings"] else ""))
+            except Exception as e:
+                r, code = dict(file=str(path), error=str(e)), 1
+                _say(f"ошибка: {path.name}: {e}")
+            report.append(r)
+            if lock.checkpoint(on_wait=waiting, poll=2):
+                _say("видеокарту ждал человек - уступил и снова получил")
+    finally:
+        lock.release()
     if a.json:
         Path(a.json).write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     return code

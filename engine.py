@@ -25,7 +25,9 @@ import contextlib
 import gc
 import io
 import os
+import queue
 import re
+import threading
 import zlib
 
 import numpy as np
@@ -109,6 +111,65 @@ def _parse_ts(text):
 
 
 # =====================================================================  MLX
+class MLXExecutor:
+    """Одна долгоживущая нить для всех вызовов MLX (2.7).
+
+    Потоки вычислений MLX привязаны к нити: массив, созданный в одной нити и не вычисленный до
+    конца, в другой нити даёт «There is no Stream(gpu, N) in current thread». Раньше Scribe грузил
+    модель в одной нити, а распознавал в новой нити на каждый запуск - и после сбоя (например,
+    нехватки памяти) в кэшах mlx_whisper оставались такие массивы, повторный запуск падал.
+    Теперь прогрев, распознавание, детектор языка и выгрузка идут здесь; остальные нити только
+    ставят задачу и ждут результат. Прогресс и отмена работают как раньше (колбэки потокобезопасны).
+    Практика: vllm-mlx bind_generation_streams, mlx-lm #1179, mlx-audio #744."""
+
+    def __init__(self):
+        self._q = queue.Queue()
+        self._thread = threading.Thread(target=self._loop, name="scribe-mlx", daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            fn, args, kw, box, done = self._q.get()
+            try:
+                box["r"] = fn(*args, **kw)
+            except BaseException as e:          # noqa: BLE001 - исключение уходит вызывающей нити
+                box["e"] = e
+            finally:
+                done.set()
+
+    def run(self, fn, *args, **kw):
+        if threading.current_thread() is self._thread:      # вызов изнутри задачи - сразу
+            return fn(*args, **kw)
+        box, done = {}, threading.Event()
+        self._q.put((fn, args, kw, box, done))
+        done.wait()
+        if "e" in box:
+            raise box["e"]
+        return box.get("r")
+
+
+_MLX_EXEC = {}
+
+
+def mlx_executor():
+    if "x" not in _MLX_EXEC:
+        _MLX_EXEC["x"] = MLXExecutor()
+    return _MLX_EXEC["x"]
+
+
+class _OnExecutor:
+    """Обёртка объекта MLX: каждый его метод выполняется в нити-исполнителе."""
+
+    def __init__(self, obj, ex):
+        self._obj, self._ex = obj, ex
+
+    def __getattr__(self, name):
+        val = getattr(self._obj, name)
+        if callable(val):
+            return lambda *a, **k: self._ex.run(val, *a, **k)
+        return val
+
+
 class MLXLID:
     """Детектор языка и быстрое двойное распознавание на модели Whisper (MLX).
     Модель - та же, что для распознавания (ModelHolder), второй раз не грузится."""
@@ -245,8 +306,31 @@ class MLXEngine:
     device = "mlx"
 
     def __init__(self):
-        import mlx_whisper  # noqa: F401 - проверка, что MLX есть
+        self._x = mlx_executor()
+        self._x.run(lambda: __import__("mlx_whisper"))   # проверка, что MLX есть
         self._lids = {}
+
+    def _call(self, fn, *args, **kw):
+        """Задача MLX в нити-исполнителе. Сбой (не отмена) - полная очистка: следующий запуск
+        начинается с чистого состояния, а не с остатков упавшего."""
+        try:
+            return self._x.run(self._guarded, fn, *args, **kw)
+        except Cancelled:
+            raise
+        except Exception:
+            self._x.run(self._reset)
+            raise
+
+    def _guarded(self, fn, *args, **kw):
+        """Модель в кэше mlx_whisper загружена не здесь (в другой нити) - выгрузить: у неё есть
+        невычисленные поля (_positional_embedding), привязанные к той нити."""
+        from mlx_whisper.transcribe import ModelHolder
+        if ModelHolder.model is not None and id(ModelHolder.model) != getattr(self, "_own_model", None):
+            self._reset()
+        try:
+            return fn(*args, **kw)
+        finally:
+            self._own_model = id(ModelHolder.model) if ModelHolder.model is not None else None
 
     @staticmethod
     def repo(model):
@@ -261,6 +345,9 @@ class MLXEngine:
         return MODELS[k][2] if k in MODELS else 0
 
     def transcribe(self, audio, model, lang=None, prompt=None, temperature=0.0, prog=None, cancel=None):
+        return self._call(self._transcribe, audio, model, lang, prompt, temperature, prog, cancel)
+
+    def _transcribe(self, audio, model, lang=None, prompt=None, temperature=0.0, prog=None, cancel=None):
         """Один вызов mlx_whisper по массиву в памяти, с прогрессом и отменой."""
         import mlx_whisper
         catcher = _ProgressCatcher(len(audio) / SR, prog, cancel)
@@ -271,6 +358,9 @@ class MLXEngine:
         return res.get("segments", [])
 
     def transcribe_text(self, audio, model, lang=None, prompt=None):
+        return self._call(self._transcribe_text, audio, model, lang, prompt)
+
+    def _transcribe_text(self, audio, model, lang=None, prompt=None):
         """Для диктофона - ровно тот же вызов, что в 2.3 (Legal Knowledge Desk на него рассчитывает)."""
         import mlx_whisper
         res = mlx_whisper.transcribe(
@@ -280,6 +370,9 @@ class MLXEngine:
         return (res.get("text") or "").strip()
 
     def warmup(self, model):
+        return self._call(self._warmup, model)
+
+    def _warmup(self, model):
         import mlx_whisper
         mlx_whisper.transcribe(np.zeros(SR, dtype=np.float32), path_or_hf_repo=self.repo(model),
                                language="ru", verbose=False)
@@ -294,10 +387,26 @@ class MLXEngine:
             if not own:
                 for k in [k for k in self._lids if not k[1]]:
                     del self._lids[k]
-            self._lids[key] = MLXLID(self.repo(model), own=own)
+            # создаётся и работает в нити-исполнителе; сбой - очистка, как у распознавания
+            obj = self._call(MLXLID, self.repo(model), own=own)
+            self._lids[key] = _OnExecutor(obj, _Guard(self))
         return self._lids[key]
 
     def unload(self):
+        self._x.run(self._unload)
+
+    def _reset(self):
+        """После сбоя: модели, кэш MLX и кэши mlx_whisper (фильтры спектрограммы и окно), где мог
+        остаться недовычисленный массив."""
+        self._unload()
+        try:
+            from mlx_whisper import audio as _a
+            _a.mel_filters.cache_clear()
+            _a.hanning.cache_clear()
+        except Exception:
+            pass
+
+    def _unload(self):
         self._lids.clear()
         try:
             from mlx_whisper.transcribe import ModelHolder
@@ -311,6 +420,16 @@ class MLXEngine:
             mx.clear_cache()
         except Exception:
             pass
+
+
+class _Guard:
+    """Исполнитель для детектора языка: методы - в нити MLX, сбой - очистка движка."""
+
+    def __init__(self, eng):
+        self._eng = eng
+
+    def run(self, fn, *a, **k):
+        return self._eng._call(fn, *a, **k)
 
 
 # ========================================================  faster-whisper
@@ -493,10 +612,33 @@ class FWEngine:
 
 # ============================================================  выбор
 _ENGINE = {}
+_FORCED = threading.local()     # движок, подставленный для этой нити (файл «на процессоре», 2.7)
+
+
+@contextlib.contextmanager
+def using(eng):
+    """На время блока get_engine() в этой нити возвращает eng (например, процессор вместо MLX,
+    когда видеокарте не хватило памяти). Остальные нити не затрагиваются."""
+    prev = getattr(_FORCED, "eng", None)
+    _FORCED.eng = eng
+    try:
+        yield eng
+    finally:
+        _FORCED.eng = prev
+
+
+def cpu_engine():
+    """faster-whisper на процессоре - запасной путь, когда видеокарте не хватает памяти."""
+    if "cpu" not in _ENGINE:
+        _ENGINE["cpu"] = FWEngine(device="cpu")
+    return _ENGINE["cpu"]
 
 
 def get_engine():
     """Apple Silicon - MLX; иначе faster-whisper (видеокарта NVIDIA или процессор)."""
+    forced = getattr(_FORCED, "eng", None)
+    if forced is not None:
+        return forced
     if "e" not in _ENGINE:
         want = os.environ.get("SCRIBE_ENGINE", "")
         eng = None
