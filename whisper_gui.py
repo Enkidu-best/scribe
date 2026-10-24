@@ -368,8 +368,11 @@ class App:
             ts=cfg.get("ts", False), summary=cfg.get("summary", False))
 
         root.title("Scribe")
-        root.geometry("1180x760")
-        root.minsize(1000, 660)
+        # текст 17 px (T.TEXT_SCALE, Единый стандарт 1.5): окно растёт вместе с ним, но не больше экрана
+        k = T.TEXT_SCALE
+        sw, sh = root.winfo_screenwidth() - 40, root.winfo_screenheight() - 90
+        root.geometry(f"{min(sw, int(1180 * k))}x{min(sh, int(760 * k))}")
+        root.minsize(min(sw, int(1000 * k)), min(sh, int(660 * k)))
         try:
             _icon = Path(__file__).with_name("scribe.png")
             if _icon.exists():

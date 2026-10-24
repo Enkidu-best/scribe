@@ -98,7 +98,7 @@ class GpuPage(unittest.TestCase):
         self.assertIn("Занято 6 из 13 ГБ", pg.inner_text("#memtext"))
         self.assertEqual(pg.locator("#working button").count(), 0)      # работа человека - без «Отпустить»
         self.assertEqual(pg.inner_text("#waiting button"), "Отпустить")
-        self.assertEqual(pg.evaluate("getComputedStyle(document.documentElement).fontSize"), "19.2px")  # 120 %
+        self.assertEqual(pg.evaluate("getComputedStyle(document.body).fontSize"), "17px")   # 100 % = 17 px (стандарт 1.5)
         if SHOTS:
             SHOTS.mkdir(parents=True, exist_ok=True)
             pg.screenshot(path=str(SHOTS / "gpu-page-ru-light.png"), full_page=True)

@@ -85,13 +85,13 @@ class Budget(unittest.TestCase):
         lk = self.mine(need=8)
         self.assertFalse(lk.try_acquire())
 
-    # B4: «Только по очереди» - вместе не работают даже если помещается
+    # B4: «По одной» - вместе не работают даже если помещается
     def test_one_at_a_time(self):
         self.settings(mode="one_at_a_time")
         self.other(need=6)
         self.assertFalse(self.mine(need=2).try_acquire())
 
-    # B5: фон рядом - только если не ждёт человек; «Пауза фону» - не встаёт рядом
+    # B5: фон рядом - только если не ждёт человек; «Фон на паузе» - не встаёт рядом
     def test_background_after_humans_and_pause(self):
         self.other(need=6)
         hum = self.mine(need=9, program="Понятный документ")      # человек не помещается - встаёт в очередь
@@ -106,7 +106,7 @@ class Budget(unittest.TestCase):
         self.assertTrue(bg.try_acquire() and bg.joined)
         bg.release()
 
-    # B6: фон уступает человеку на контрольной точке; «Ночь - всё фону» - не уступает; пауза - уступает всегда
+    # B6: фон уступает человеку на контрольной точке; «Не прерывать фон» - не уступает; пауза - уступает всегда
     def test_checkpoint_modes(self):
         bg = self.mine(need=None, who="background", program="Прогон")
         self.assertTrue(bg.try_acquire())
@@ -145,7 +145,7 @@ class Budget(unittest.TestCase):
         self.other(need=6)
         out = subprocess.run(["bash", str(SH), "--path", str(self.lock), "mode", "one_at_a_time"],
                              capture_output=True, text=True).stdout
-        self.assertIn("Режим: Только по очереди", out)
+        self.assertIn("Режим: По одной", out)
         self.assertIn("занято 6 из 13 ГБ", out)
         self.assertIn("«Herald»", out)
         self.assertEqual(json.loads(hl.settings_path(self.lock).read_text(encoding="utf-8"))["mode"], "one_at_a_time")
@@ -170,7 +170,7 @@ class Budget(unittest.TestCase):
         self.settings(needs_gb={"Legal Doc Builder": {"gb": 6, "measured": False}})
         self.assertFalse(self.mine(need=2).try_acquire())
 
-    # B11: «Пауза фону» при свободной видеокарте - фон не берёт, человек берёт
+    # B11: «Фон на паузе» при свободной видеокарте - фон не берёт, человек берёт
     def test_pause_blocks_background_on_free_gpu(self):
         self.settings(pause_background=True)
         bg = self.mine(need=None, who="background", program="Прогон")

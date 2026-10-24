@@ -46,10 +46,16 @@ def font(size=14, bold=False):
     return ctk.CTkFont(family=FAMILY, size=size, weight="bold" if bold else "normal")
 
 
+# Один размер текста во всех программах (Единый стандарт 1.5, 24.10): шрифты окна заданы на основе 14, основной текст
+# на экране - 17 px, как в LKD и на странице «Видеокарта»; всё окно - тем же коэффициентом (как Herald при «Aa» 100 %)
+TEXT_SCALE = 17 / 14
+
+
 def apply():
     """Подменяем цвета встроенной темы customtkinter на токены LKD - тогда все
-    стандартные виджеты сразу выглядят как надо."""
+    стандартные виджеты сразу выглядят как надо. Масштаб - TEXT_SCALE."""
     ctk.set_default_color_theme("blue")
+    ctk.set_widget_scaling(TEXT_SCALE)
     t = ctk.ThemeManager.theme
     t["CTk"]["fg_color"] = list(BG)
     t["CTkToplevel"]["fg_color"] = list(BG)

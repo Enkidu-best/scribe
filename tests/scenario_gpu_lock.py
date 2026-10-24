@@ -126,7 +126,7 @@ G.T.apply()
 G.ctk.set_appearance_mode("light")
 root = G.RootTk()
 app = G.App(root, G.load_config())
-root.geometry("1180x760+60+40")
+root.geometry(f"{int(1180 * G.T.TEXT_SCALE)}x{min(int(760 * G.T.TEXT_SCALE), root.winfo_screenheight() - 90)}+60+40")
 results = []
 
 
