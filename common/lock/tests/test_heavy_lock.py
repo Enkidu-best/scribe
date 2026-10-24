@@ -97,6 +97,30 @@ class Base(unittest.TestCase):
         return [ln.split("\t") for ln in f.read_text(encoding="utf-8").splitlines()] if f.exists() else []
 
 
+class PageLink(Base):
+    """Ссылка «Открыть страницу «Видеокарта»» (README, 12): только там, где лежат «_общие модули»."""
+
+    def test_no_page_in_temp(self):
+        self.assertIsNone(hl.page_tools(self.lock))
+        self.assertFalse(hl.status_json(self.lock)["page"])
+        self.assertFalse(hl.open_page(self.lock))
+
+    def test_page_opens_without_waiting(self):
+        tools = self.tmp / "_общие модули" / "lock" / "tools"
+        tools.mkdir(parents=True)
+        (tools / "gpu_page.py").write_text("", encoding="utf-8")
+        self.assertEqual(hl.page_tools(self.lock), tools)
+        self.assertTrue(hl.status_json(self.lock)["page"])
+        calls = []
+        real = hl.subprocess.Popen
+        hl.subprocess.Popen = lambda cmd, **kw: calls.append(cmd)
+        try:
+            self.assertTrue(hl.open_page(self.lock))
+        finally:
+            hl.subprocess.Popen = real
+        self.assertEqual(calls[0][-1], str(tools / "gpu_page.py"))     # нет .app - сам сервер страницы
+
+
 class TwoProcesses(Base):
     """L1: второй ждёт и получает замок после первого."""
 

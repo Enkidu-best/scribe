@@ -28,6 +28,7 @@ class Budget(unittest.TestCase):
         self.lock = self.tmp / ".heavy-lock"
         self._env = {k: os.environ.pop(k) for k in ("HEAVY_LOCK_HELD", "HEAVY_LOCK_WHO", "HEAVY_LOCK") if k in os.environ}
         self.procs = []
+        hl.save_settings(self.lock, budget_gb=13)       # правила - на бюджете 13 ГБ (по умолчанию теперь 9, решение 24.10)
 
     def tearDown(self):
         for p in self.procs:

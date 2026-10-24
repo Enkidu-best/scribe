@@ -8,6 +8,7 @@ T - модуль темы программы (theme.py: label, button, цвет�
 """
 from __future__ import annotations
 
+from .. import heavy_lock as hl
 from .texts import cpu_option, describe, t
 
 
@@ -57,6 +58,9 @@ def ask_busy(root, T, holder, lang: str = "ru", cpu: bool = False, queue_names=(
     foot.pack(fill="x", pady=(14, 0))
     buttons["cancel"] = T.button(foot, t("cancel", lang), kind="ghost", width=110, command=lambda: close(None))
     buttons["cancel"].pack(side="right")
+    if hl.page_tools() is not None:           # страница «Видеокарта» (README, 12) - окно остаётся открытым
+        buttons["page"] = T.button(foot, t("open_page", lang), kind="ghost", command=hl.open_page)
+        buttons["page"].pack(side="left")
 
     dlg.bind("<Return>", lambda e: close("wait"))
     dlg.bind("<Escape>", lambda e: close(None))

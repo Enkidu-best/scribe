@@ -92,6 +92,20 @@ class WebDialog(unittest.TestCase):
         self.assertEqual(pg.evaluate("window.ans"), "wait")
         pg.close()
 
+    def test_page_link(self):
+        pg = self.open()
+        self.ask(pg, {"lang": "ru"})
+        self.assertIsNone(pg.query_selector("button[data-answer=page]"))     # страницы нет - ссылки нет
+        pg.keyboard.press("Escape")
+        pg.evaluate("window.opened = 0")
+        pg.evaluate("([h]) => { HeavyLockUI.ask(h, {lang: 'ru', page: () => window.opened++}); }", [HOLDER])
+        pg.wait_for_selector(".hl-dialog")
+        self.assertEqual(pg.inner_text("button[data-answer=page]"), "Открыть страницу «Видеокарта»")
+        pg.click("button[data-answer=page]")
+        self.assertEqual(pg.evaluate("window.opened"), 1)
+        self.assertEqual(len(pg.query_selector_all(".hl-dialog")), 1)          # окно очереди остаётся
+        pg.close()
+
     def test_cpu_slow(self):
         pg = self.open()
         self.ask(pg, {"lang": "ru", "cpu": {"seconds": 7200, "factor": 12}})

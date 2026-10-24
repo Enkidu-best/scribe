@@ -104,7 +104,7 @@ MODES = ("mine_first", "one_at_a_time", "night")    # «Сначала мои п
 DEFAULT_SETTINGS = {
     "mode": "mine_first",
     # 16 ГБ минус система и окна Андрея (оценка 3 ГБ - уточнить замером: занято без программ + 3 ГБ)
-    "budget_gb": 13.0,
+    "budget_gb": 9.0,
     "pause_background": False,
     # пиковая память тяжёлой операции программы, ГБ. Вместе работают только программы с ЗАМЕРЕННОЙ памятью
     # (measured: true) - по оценке рядом никто не запускается (README, 10.2)
@@ -369,6 +369,29 @@ def alongside(path: Path | None = None) -> list[Holder]:
     return [h for h in _entries(lock) if h.kind == "now"]
 
 
+def page_tools(path: Path | None = None) -> Path | None:
+    """Папка страницы «Видеокарта» (README, 12): «_общие модули/lock/tools» рядом с папкой очереди. Есть только там, где
+    лежат проекты (Mac Андрея); у собранной программы и в проверках на временной папке - None, ссылки в окне нет."""
+    lock = Path(path) if path else default_path()
+    tools = lock.parent / "_общие модули" / "lock" / "tools"
+    return tools if (tools / "gpu_page.py").exists() else None
+
+
+def open_page(path: Path | None = None) -> bool:
+    """«Открыть страницу «Видеокарта»» из окна «Видеокарта занята»: «Видеокарта.app» (стандарт 6.2 - через launcher.c,
+    macOS спросит доступ к «Рабочему столу» один раз) или сам gpu_page.py. Не ждёт. False - страницы здесь нет."""
+    tools = page_tools(path)
+    if tools is None:
+        return False
+    app = tools / "Видеокарта.app"
+    cmd = ["open", str(app)] if sys.platform == "darwin" and app.exists() else [sys.executable, str(tools / "gpu_page.py")]
+    try:
+        subprocess.Popen(cmd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return False
+    return True
+
+
 def status_json(path: Path | None = None, me: "HeavyLock | None" = None) -> dict:
     """Для веб-окна: GET /api/heavy-lock."""
     lock = Path(path) if path else (me.path if me else default_path())
@@ -387,7 +410,7 @@ def status_json(path: Path | None = None, me: "HeavyLock | None" = None) -> dict
     d = {"free": h is None, "holder": js(h) if h else None,
          "queue": [js(w) for w in q], "alongside": [js(w) for w in alongside(lock)],
          "version": VERSION, "mode": cfg["mode"], "budget_gb": cfg["budget_gb"], "used_gb": used,
-         "pause_background": cfg["pause_background"]}
+         "pause_background": cfg["pause_background"], "page": page_tools(lock) is not None}
     if me is not None:
         d["me"] = {"held": me.held, "waiting": me.waiting, "now": me.now, "ahead": me.ahead() if me.waiting else 0,
                    "idle_released": me.idle_released, "program": me.program, "joined": me.joined}

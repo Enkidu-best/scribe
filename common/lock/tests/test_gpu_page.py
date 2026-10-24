@@ -38,7 +38,7 @@ class GpuPage(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp(prefix="hl-gpu-page-"))
         cls.lock = cls.tmp / ".heavy-lock"
-        hl.save_settings(cls.lock, needs_gb={"Herald": {"gb": 6, "measured": True}})
+        hl.save_settings(cls.lock, budget_gb=13, needs_gb={"Herald": {"gb": 6, "measured": True}})
         with socket.socket() as so:
             so.bind(("127.0.0.1", 0))
             cls.port = so.getsockname()[1]

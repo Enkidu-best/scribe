@@ -1,7 +1,8 @@
 /* Окно «Видеокарта занята» для веб-программ (IC, CD, LKD, LDB) - README, 6.3.
    Тексты - ../texts.json (тот же файл, что у Python). Сервер отдаёт GET /api/heavy-lock = heavy_lock.status_json().
 
-   HeavyLockUI.ask(holder, {lang, cpu, queue}) → Promise<"wait" | "now" | "cpu" | null>
+   HeavyLockUI.ask(holder, {lang, cpu, queue, page}) → Promise<"wait" | "now" | "cpu" | null>
+   page: адрес программы (POST, она вызывает heavy_lock.open_page) или функция - ссылка «Открыть страницу «Видеокарта»»
    cpu: true - кнопка «На процессоре»; {seconds, factor} - с прогнозом (> 3 раз медленнее - «очень медленно»)
    HeavyLockUI.describe(holder, lang), HeavyLockUI.waitingLine(holder, ahead, lang)
    HeavyLockUI.headerState(status, lang, {modelOk, working, error}) → {state, text, kind}  (стандарт 2.1) */
@@ -107,6 +108,15 @@
       const cancel = el("button", "hl-btn hl-ghost", t("cancel", lang));
       cancel.type = "button"; cancel.dataset.answer = "cancel";
       cancel.addEventListener("click", () => done(null));
+      if (opts.page) {      // страница «Видеокарта» (README, 12): функция программы или её адрес POST; окно остаётся
+        const pg = el("button", "hl-link", t("open_page", lang));
+        pg.type = "button"; pg.dataset.answer = "page";
+        pg.addEventListener("click", () => {
+          if (typeof opts.page === "function") opts.page();
+          else fetch(opts.page, { method: "POST" }).catch(() => {});
+        });
+        foot.append(pg);
+      }
       foot.append(cancel);
       box.append(list, foot);
       back.append(box);
