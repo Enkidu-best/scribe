@@ -44,6 +44,35 @@ def waiting_line(holder, ahead: int, lang: str = "ru") -> str:
     return f"{head} · {tail}"
 
 
+SLOW_FACTOR = 3.0      # медленнее видеокарты больше чем во столько раз - «очень медленно», кнопка не выделена (доп. 21:40)
+
+
+def eta_text(seconds: float, lang: str = "ru") -> str:
+    """«40 с», «12 мин», «2 ч 10 мин» - прогноз для кнопки «На процессоре»."""
+    s = max(0, int(round(seconds)))
+    if s < 60:
+        return t("eta_sec", lang, n=max(5, round(s / 5) * 5))
+    m = round(s / 60)
+    if m < 60:
+        return t("eta_min", lang, n=m)
+    h, m = divmod(m, 60)
+    return t("eta_h", lang, h=h) if m == 0 else t("eta_h_min", lang, h=h, n=m)
+
+
+def cpu_option(cpu, lang: str = "ru") -> tuple[str, str, bool] | None:
+    """Кнопка «На процессоре»: (надпись, пояснение, очень медленно). cpu: False / None - кнопки нет; True - без прогноза;
+    {"seconds": прогноз на процессоре, "factor": во сколько раз медленнее видеокарты} - с прогнозом (замер программы)."""
+    if not cpu:
+        return None
+    if cpu is True:
+        return t("cpu", lang), t("cpu_hint", lang), False
+    eta = eta_text(float(cpu.get("seconds") or 0), lang) if cpu.get("seconds") else ""
+    x = float(cpu.get("factor") or 1.0)
+    if x > SLOW_FACTOR:
+        return t("cpu_slow_btn", lang), t("cpu_slow", lang, eta=eta or "?", x=f"{x:.0f}"), True
+    return t("cpu", lang), (t("cpu_eta", lang, eta=eta) if eta else t("cpu_hint", lang)), False
+
+
 def header_state(lock=None, lang: str = "ru", model_ok: bool = True, error: bool = False,
                  working: bool = False) -> tuple[str, str, str]:
     """Строка состояния в шапке: (состояние, текст, цвет). lock - HeavyLock этой программы (или None)."""

@@ -2,6 +2,7 @@
    Тексты - ../texts.json (тот же файл, что у Python). Сервер отдаёт GET /api/heavy-lock = heavy_lock.status_json().
 
    HeavyLockUI.ask(holder, {lang, cpu, queue}) → Promise<"wait" | "now" | "cpu" | null>
+   cpu: true - кнопка «На процессоре»; {seconds, factor} - с прогнозом (> 3 раз медленнее - «очень медленно»)
    HeavyLockUI.describe(holder, lang), HeavyLockUI.waitingLine(holder, ahead, lang)
    HeavyLockUI.headerState(status, lang, {modelOk, working, error}) → {state, text, kind}  (стандарт 2.1) */
 (function (g) {
@@ -28,6 +29,23 @@
       : t(h.what ? "waiting" : "waiting_nowhat", lang, { program: program(h, lang), since: h.since_text, what: h.what });
     return head + " · " + (ahead > 0 ? t("waiting_ahead", lang, { n: ahead }) : t("waiting_next", lang));
   }
+  const SLOW_FACTOR = 3;
+  function etaText(sec, lang) {
+    const s = Math.max(0, Math.round(sec));
+    if (s < 60) return t("eta_sec", lang, { n: Math.max(5, Math.round(s / 5) * 5) });
+    let m = Math.round(s / 60);
+    if (m < 60) return t("eta_min", lang, { n: m });
+    const h = Math.floor(m / 60); m %= 60;
+    return m ? t("eta_h_min", lang, { h, n: m }) : t("eta_h", lang, { h });
+  }
+  function cpuOption(cpu, lang) {
+    if (!cpu) return null;
+    if (cpu === true) return { label: t("cpu", lang), hint: t("cpu_hint", lang), slow: false };
+    const eta = cpu.seconds ? etaText(cpu.seconds, lang) : "";
+    const x = Number(cpu.factor || 1);
+    if (x > SLOW_FACTOR) return { label: t("cpu_slow_btn", lang), hint: t("cpu_slow", lang, { eta: eta || "?", x: x.toFixed(0) }), slow: true };
+    return { label: t("cpu", lang), hint: eta ? t("cpu_eta", lang, { eta }) : t("cpu_hint", lang), slow: false };
+  }
   function headerState(st, lang, o) {
     o = o || {};
     const me = (st && st.me) || {};
@@ -49,6 +67,14 @@
     return e;
   }
 
+  // открытый модальный <dialog> программы - в верхнем слое страницы: окно очереди - внутри него, иначе его не нажать
+  function topLayer() {
+    const open = [...document.querySelectorAll("dialog[open]")].filter((d) => {
+      try { return d.matches(":modal"); } catch (e) { return true; }
+    });
+    return open.length ? open[open.length - 1] : document.body;
+  }
+
   async function ask(holder, opts) {
     opts = opts || {};
     const lang = opts.lang || document.documentElement.lang || "ru";
@@ -65,15 +91,17 @@
       if (opts.queue && opts.queue.length) {
         box.append(el("p", "hl-note", t("queue_ahead", lang, { names: opts.queue.map((n) => "«" + n + "»").join(", ") })));
       }
-      const rows = [["wait", "hl-primary", "wait_hint", ""], ["now", "", "now_hint", "hl-warn"]];
-      if (opts.cpu) rows.push(["cpu", "", "cpu_hint", ""]);
+      const rows = [["wait", "hl-primary", t("wait", lang), t("wait_hint", lang), ""],
+        ["now", "", t("now", lang), t("now_hint", lang), "hl-warn"]];
+      const co = cpuOption(opts.cpu, lang);
+      if (co) rows.push(["cpu", co.slow ? "hl-ghost hl-slow" : "", co.label, co.hint, co.slow ? "hl-warn" : ""]);
       const list = el("div", "hl-options");
       const done = (ans) => { document.removeEventListener("keydown", onKey, true); back.remove(); resolve(ans); };
-      for (const [key, cls, hint, hcls] of rows) {
-        const b = el("button", "hl-btn " + cls, t(key, lang));
+      for (const [key, cls, label, hint, hcls] of rows) {
+        const b = el("button", "hl-btn " + cls, label);
         b.type = "button"; b.dataset.answer = key;
         b.addEventListener("click", () => done(key));
-        list.append(b, el("span", "hl-hint " + hcls, t(hint, lang)));
+        list.append(b, el("span", "hl-hint " + hcls, hint));
       }
       const foot = el("div", "hl-foot");
       const cancel = el("button", "hl-btn hl-ghost", t("cancel", lang));
@@ -88,10 +116,10 @@
         else if (e.key === "Enter" && !(e.target instanceof HTMLButtonElement)) { e.preventDefault(); done("wait"); }
       }
       document.addEventListener("keydown", onKey, true);
-      document.body.append(back);
+      topLayer().append(back);
       list.querySelector("button").focus();
     });
   }
 
-  g.HeavyLockUI = { ready, t, describe, waitingLine, headerState, ask };
+  g.HeavyLockUI = { ready, t, describe, waitingLine, headerState, ask, cpuOption, etaText };
 })(window);

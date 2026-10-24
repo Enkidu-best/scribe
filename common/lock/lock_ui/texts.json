@@ -28,7 +28,14 @@
     "st_nomodel": "нет модели",
     "st_error": "ошибка",
     "someone": "другая программа",
-    "what_unknown": "без описания"
+    "what_unknown": "без описания",
+    "cpu_eta": "Без видеокарты: ≈ {eta}, ждать не нужно.",
+    "cpu_slow": "Очень медленно: ≈ {eta} (в {x} раз дольше, чем на видеокарте); процессор будет загружен полностью.",
+    "cpu_slow_btn": "На процессоре (очень медленно)",
+    "eta_min": "{n} мин",
+    "eta_h": "{h} ч",
+    "eta_h_min": "{h} ч {n} мин",
+    "eta_sec": "{n} с"
   },
   "en": {
     "title": "The GPU is busy",
@@ -59,6 +66,13 @@
     "st_nomodel": "no model",
     "st_error": "error",
     "someone": "another program",
-    "what_unknown": "no description"
+    "what_unknown": "no description",
+    "cpu_eta": "Without the GPU: ≈ {eta}, no waiting.",
+    "cpu_slow": "Very slow: ≈ {eta} ({x} times longer than on the GPU); the CPU will be fully loaded.",
+    "cpu_slow_btn": "Use the CPU (very slow)",
+    "eta_min": "{n} min",
+    "eta_h": "{h} h",
+    "eta_h_min": "{h} h {n} min",
+    "eta_sec": "{n} s"
   }
 }

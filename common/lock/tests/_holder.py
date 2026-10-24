@@ -18,7 +18,9 @@ from lock import heavy_lock as hl  # noqa: E402
 
 path, program, who, mode = sys.argv[1:5]
 what = sys.argv[5] if len(sys.argv) > 5 else ""
-lk = hl.HeavyLock(program, what, who=who, path=Path(path), idle_after=None)
+import os  # noqa: E402
+need = float(os.environ["HL_NEED_GB"]) if os.environ.get("HL_NEED_GB") else None   # бюджет памяти (1.2.0)
+lk = hl.HeavyLock(program, what, who=who, path=Path(path), idle_after=None, need_gb=need)
 stop = threading.Event()
 
 
@@ -40,7 +42,7 @@ def on_wait(_h, _ahead):
 
 
 lk.acquire(on_wait=on_wait, poll=0.05)
-print("taken", flush=True)
+print("joined" if lk.joined else "taken", flush=True)
 if mode == "bg-checkpoint":
     while not stop.is_set():
         if lk.checkpoint(poll=0.05):

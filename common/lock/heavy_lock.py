@@ -9,9 +9,11 @@
   * очередь честная: сначала люди, потом фон, внутри - по времени постановки;
   * фон отдаёт замок ждущему человеку на своей контрольной точке (`checkpoint`);
   * сессия человека без действий 15 минут отпускает замок сама (`idle_check`), при продолжении - `resume`;
-  * «Запустить сейчас» - работа поверх чужого замка, видна в очереди как `now-…`.
+  * «Запустить сейчас» - работа поверх чужого замка, видна в очереди как `now-…`;
+  * «Пауза фону» и «Отпустить» (страница «Видеокарта», 1.3.0): фон на паузе или отпущенный не берёт видеокарту и
+    отдаёт её на контрольной точке.
 
-Командная строка (её вызывает heavy_lock.sh): take / release / status / yield / run.
+Командная строка (её вызывает heavy_lock.sh): take / release / status / yield / run / gpu / mode / pause-bg / let-go / back.
 """
 from __future__ import annotations
 
@@ -97,6 +99,121 @@ def alive(pid: int | None) -> bool:
         return False
 
 
+# ============================================================ бюджет памяти (1.2.0, «_Общие модули 02»)
+MODES = ("mine_first", "one_at_a_time", "night")    # «Сначала мои программы» / «Только по очереди» / «Ночь - всё фону»
+DEFAULT_SETTINGS = {
+    "mode": "mine_first",
+    # 16 ГБ минус система и окна Андрея (оценка 3 ГБ - уточнить замером: занято без программ + 3 ГБ)
+    "budget_gb": 13.0,
+    "pause_background": False,
+    # пиковая память тяжёлой операции программы, ГБ. Вместе работают только программы с ЗАМЕРЕННОЙ памятью
+    # (measured: true) - по оценке рядом никто не запускается (README, 10.2)
+    "needs_gb": {
+        "Herald": {"gb": 6.0, "measured": False, "note": "F5 обученный голос, оценка"},
+        "Scribe": {"gb": 3.5, "measured": False, "note": "large-v3-turbo, оценка"},
+        "Interview Coach": {"gb": 9.0, "measured": False, "note": "qwen3.5:9b + Whisper + голос, оценка"},
+        "Понятный документ": {"gb": 7.0, "measured": False, "note": "qwen3.5:9b, оценка; qwen3:14b - около 10"},
+        "Legal Knowledge Desk": {"gb": 8.0, "measured": False, "note": "модель ответа + эмбеддинги, оценка"},
+        "Legal Doc Builder": {"gb": 7.0, "measured": False, "note": "qwen3.5:9b, оценка"},
+        "Anonymizer": {"gb": 7.0, "measured": False, "note": "qwen3.5:9b, оценка"},
+    },
+}
+
+
+def settings_path(lock: Path) -> Path:
+    """Один файл настроек рядом с замком: «Разработка ПО»/.heavy-lock-settings.json."""
+    return lock.with_name(lock.name + "-settings.json")
+
+
+def settings(lock: Path) -> dict:
+    """Настройки диспетчера: файл рядом с замком поверх значений по умолчанию; нет файла - по умолчанию."""
+    d = json.loads(json.dumps(DEFAULT_SETTINGS))
+    try:
+        user = json.loads(settings_path(lock).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return d
+    for k, v in user.items():
+        if k == "needs_gb" and isinstance(v, dict):
+            d["needs_gb"].update(v)
+        elif k in d:
+            d[k] = v
+    if d["mode"] not in MODES:
+        d["mode"] = "one_at_a_time"
+    return d
+
+
+def save_settings(lock: Path, **changes) -> dict:
+    """Изменить настройки (режим, пауза фону, бюджет, строка таблицы памяти) - атомарно."""
+    try:
+        cur = json.loads(settings_path(lock).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cur = {}
+    for k, v in changes.items():
+        if k == "needs_gb":
+            cur.setdefault("needs_gb", {}).update(v)
+        else:
+            cur[k] = v
+    tmp = settings_path(lock).with_suffix(".tmp")
+    tmp.write_text(json.dumps(cur, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, settings_path(lock))
+    return settings(lock)
+
+
+def _off_file(lock: Path, pid: int | None) -> Path:
+    return queue_dir(lock) / f"off-{pid}"
+
+
+def held_off(lock: Path, pid: int | None) -> bool:
+    """Фон этого процесса отпущен кнопкой «Отпустить» (README, 12): не берёт видеокарту, пока не «Вернуть».
+    Процесс завершился - отметка снимается."""
+    f = _off_file(lock, pid)
+    if not pid or not f.exists():
+        return False
+    if not alive(pid):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def let_go(lock: Path, pid: int, on: bool = True) -> None:
+    """«Отпустить» (on) / «Вернуть» (off) фон процесса pid. Работу человека не трогает - её отпускают в её окне."""
+    f = _off_file(lock, pid)
+    if on:
+        queue_dir(lock).mkdir(exist_ok=True)
+        f.write_text(dt.datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    else:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def need_of(h: "Holder", cfg: dict) -> float | None:
+    """Память операции: заявленная (need_gb) или замеренная по таблице; None - неизвестна (рядом не запускать)."""
+    if h.need_gb:
+        return float(h.need_gb)
+    row = cfg["needs_gb"].get(h.program)
+    if isinstance(row, dict) and row.get("measured") and row.get("gb"):
+        return float(row["gb"])
+    return None
+
+
+def used_gb(lock: Path, cfg: dict | None = None) -> tuple[float | None, list]:
+    """Сколько памяти уже занято: владелец + работающие рядом. (None, …) - чья-то память неизвестна."""
+    cfg = cfg or settings(lock)
+    working = [h for h in [status(lock)] if h is not None] + alongside(lock)
+    total = 0.0
+    for h in working:
+        n = need_of(h, cfg)
+        if n is None:
+            return None, working
+        total += n
+    return total, working
+
+
 # ============================================================ кто держит
 @dataclass
 class Holder:
@@ -111,6 +228,7 @@ class Holder:
     legacy: bool = False        # прочитан из старой строки owner (без owner.json)
     kind: str = "hold"          # hold - держит; wait - в очереди; now - работает поверх
     ts: float = 0.0             # время постановки в очередь (для порядка)
+    need_gb: float | None = None    # заявленная пиковая память, ГБ (1.2.0)
     file: Path | None = field(default=None, repr=False)
 
     @property
@@ -124,7 +242,7 @@ class Holder:
     def to_json(self) -> dict:
         return {"program": self.program, "pid": self.pid, "what": self.what, "who": self.who,
                 "since": self.since.isoformat(timespec="seconds") if self.since else None,
-                "since_text": self.since_text, "host": self.host, "kind": self.kind}
+                "since_text": self.since_text, "host": self.host, "kind": self.kind, "need_gb": self.need_gb}
 
 
 def since_text(since: dt.datetime | None, now: dt.datetime | None = None) -> str:
@@ -156,7 +274,8 @@ def _read_holder(lock: Path) -> Holder | None:
         d = json.loads((lock / "owner.json").read_text(encoding="utf-8"))
         since = dt.datetime.fromisoformat(d["since"]) if d.get("since") else None
         return Holder(program=d.get("program") or "?", pid=d.get("pid"), what=d.get("what", ""),
-                      who=d.get("who", HUMAN), since=since, host=d.get("host", ""), token=d.get("token", ""))
+                      who=d.get("who", HUMAN), since=since, host=d.get("host", ""), token=d.get("token", ""),
+                      need_gb=d.get("need_gb"))
     except (OSError, ValueError, KeyError, TypeError):
         pass
     try:
@@ -230,7 +349,7 @@ def _entries(lock: Path) -> list[Holder]:
         since = dt.datetime.fromisoformat(d["since"]) if d.get("since") else None
         out.append(Holder(program=d.get("program") or "?", pid=d.get("pid"), what=d.get("what", ""),
                           who=d.get("who", HUMAN), since=since, kind=d.get("kind", "wait"),
-                          ts=float(d.get("ts", 0)), token=d.get("token", ""), file=f))
+                          ts=float(d.get("ts", 0)), token=d.get("token", ""), need_gb=d.get("need_gb"), file=f))
     return out
 
 
@@ -255,12 +374,23 @@ def status_json(path: Path | None = None, me: "HeavyLock | None" = None) -> dict
     lock = Path(path) if path else (me.path if me else default_path())
     h = status(lock)
     q = queue(lock)
-    d = {"free": h is None, "holder": h.to_json() if h else None,
-         "queue": [w.to_json() for w in q], "alongside": [w.to_json() for w in alongside(lock)],
-         "version": VERSION}
+    cfg = settings(lock)
+    used, _ = used_gb(lock, cfg)
+    def js(w: Holder) -> dict:
+        r = w.to_json()
+        r["off"] = w.background and held_off(lock, w.pid)
+        n = need_of(w, cfg)
+        row = cfg["needs_gb"].get(w.program) or {}
+        r["gb"], r["gb_how"] = n, ("declared" if w.need_gb else ("measured" if row.get("measured") else "unknown"))
+        return r
+
+    d = {"free": h is None, "holder": js(h) if h else None,
+         "queue": [js(w) for w in q], "alongside": [js(w) for w in alongside(lock)],
+         "version": VERSION, "mode": cfg["mode"], "budget_gb": cfg["budget_gb"], "used_gb": used,
+         "pause_background": cfg["pause_background"]}
     if me is not None:
         d["me"] = {"held": me.held, "waiting": me.waiting, "now": me.now, "ahead": me.ahead() if me.waiting else 0,
-                   "idle_released": me.idle_released, "program": me.program}
+                   "idle_released": me.idle_released, "program": me.program, "joined": me.joined}
     return d
 
 
@@ -295,8 +425,9 @@ class HeavyLock:
 
     def __init__(self, program: str, what: str = "", who: str | None = None, path: Path | str | None = None,
                  idle_after: float | None = IDLE_AFTER, held_env: str | None = None, path_env: str | None = None,
-                 clock=time.monotonic, pid: int | None = None) -> None:
+                 clock=time.monotonic, pid: int | None = None, need_gb: float | None = None) -> None:
         self.program = program
+        self.need_gb = need_gb       # пиковая память операции, ГБ; None - по таблице настроек (README, 10)
         self.what = what
         env_who = os.environ.get("HEAVY_LOCK_WHO")
         self.who = who or (env_who if env_who in (HUMAN, BACKGROUND) else HUMAN)
@@ -311,6 +442,7 @@ class HeavyLock:
         self.outside = False        # держит запустивший (HEAVY_LOCK_HELD=1)
         self.unavailable = ""       # папки нет или нет прав - работаем без замка (README, 5.8)
         self.now = False            # работаем поверх чужого замка
+        self.joined = False         # поверх - сами, по бюджету памяти (а не кнопкой «Запустить сейчас»)
         self.waiting = False
         self.idle_released = False
         self.last_active = clock()
@@ -344,7 +476,8 @@ class HeavyLock:
         ts = time.time()
         name = f"{'now-' if kind == 'now' else ''}{now:%Y%m%d-%H%M%S}-{now:%f}-{_slug(self.program)}-{self.pid}.json"
         d = {"program": self.program, "pid": self.pid, "what": self.what, "who": self.who, "kind": kind,
-             "since": now.isoformat(timespec="seconds"), "ts": ts, "token": self.token, "version": VERSION}
+             "since": now.isoformat(timespec="seconds"), "ts": ts, "token": self.token, "version": VERSION,
+             "need_gb": self.need_gb}
         try:
             qd.mkdir(exist_ok=True)       # рядом с замком; чужих папок не создаём
             tmp = qd / (name + ".tmp")
@@ -365,7 +498,7 @@ class HeavyLock:
     # ---------- очередь
     def ahead(self) -> int:
         """Сколько живых ожидающих передо мной. Не в очереди - как будто встал в конец своего класса."""
-        q = [h for h in queue(self.path) if h.token != self.token]
+        q = [h for h in queue(self.path) if h.token != self.token and not self._parked(h)]
         if self._qfile is not None:
             mine = Holder(self.program, self.pid, who=self.who, ts=self._ts, file=self._qfile)
             return sum(1 for h in q if _order(h) < _order(mine))
@@ -373,8 +506,17 @@ class HeavyLock:
             return sum(1 for h in q if h.who == HUMAN)
         return len(q)
 
+    def _parked(self, h: Holder) -> bool:
+        """Фон на паузе или отпущенный ждёт не своей очереди, а кнопки - другим не загораживает (README, 12)."""
+        if not h.background:
+            return False
+        return held_off(self.path, h.pid) or settings(self.path)["pause_background"]
+
+    def _bg_parked(self) -> bool:
+        return self.who == BACKGROUND and (settings(self.path)["pause_background"] or held_off(self.path, self.pid))
+
     def ahead_names(self) -> list[str]:
-        q = [h for h in queue(self.path) if h.token != self.token]
+        q = [h for h in queue(self.path) if h.token != self.token and not self._parked(h)]
         return [h.program for h in q][: max(0, self.ahead())]
 
     # ---------- взять / отдать
@@ -391,15 +533,22 @@ class HeavyLock:
                 self.unavailable = f"{lock} - не папка"
                 self.held = True
                 return True
+            if self._bg_parked():
+                return False                    # «Пауза фону» / «Отпустить» - ждать кнопки, а не очереди
             if self.ahead() > 0:
                 return False
             for _ in range(3):              # повтор - после снятия брошенного замка
+                if self.now:
+                    if self.joined:
+                        return True             # уже работаем рядом по бюджету - ждать замок не нужно
+                elif not self._fits_alongside_free(lock):
+                    return False                # замок свободен, но рядом работают и места не хватает
                 try:
                     lock.mkdir()
                 except FileExistsError:
                     if self._break_stale(lock):
                         continue
-                    return False
+                    return self._join()
                 except OSError as e:        # нет папки проектов или прав - работаем без замка
                     self.unavailable = str(e)
                     self.held = True
@@ -425,12 +574,59 @@ class HeavyLock:
                 return True
             return False
 
+    # ---------- бюджет памяти (README, 10)
+    def _my_need(self, cfg: dict) -> float | None:
+        return need_of(Holder(self.program, need_gb=self.need_gb), cfg)
+
+    def _may_join(self, cfg: dict) -> bool:
+        if cfg["mode"] == "one_at_a_time":
+            return False
+        if self.who == BACKGROUND:
+            if cfg["pause_background"]:
+                return False
+            if cfg["mode"] != "night" and self.human_waiting():
+                return False                    # люди раньше фона
+        return True
+
+    def _fits(self, cfg: dict) -> bool:
+        mine = self._my_need(cfg)
+        if mine is None:
+            return False
+        used, _ = used_gb(self.path, cfg)
+        return used is not None and used + mine <= float(cfg["budget_gb"])
+
+    def _fits_alongside_free(self, lock: Path) -> bool:
+        """Замок свободен: взять можно, если рядом никто не работает или в режимах бюджета всё помещается."""
+        al = alongside(lock)
+        if not al:
+            return True
+        cfg = settings(lock)
+        if cfg["mode"] == "one_at_a_time":
+            return True                         # как до 1.2.0: «поверх» - решение человека, замок не держит
+        known = self._my_need(cfg) is not None and all(need_of(h, cfg) is not None for h in al)
+        return self._fits(cfg) if known else True     # чья-то память неизвестна - как до 1.2.0
+
+    def _join(self) -> bool:
+        """Замок занят: встать рядом сами, если режим и бюджет памяти позволяют (README, 10.3)."""
+        cfg = settings(self.path)
+        if not self._may_join(cfg) or not self._fits(cfg):
+            return False
+        self.now = self.joined = self.held = True
+        self._nowfile = self._entry("now")
+        self.last_active = self.clock()
+        self._t_take = time.time()
+        self._drop(self._qfile)
+        self._qfile = None
+        used, _ = used_gb(self.path, cfg)
+        self._journal("join", note=f"{(self.holder() or Holder('-')).program}; занято {used} из {cfg['budget_gb']} ГБ")
+        return True
+
     def _write_owner(self, lock: Path) -> None:
         now = dt.datetime.now()
         (lock / "owner").write_text(f"{self.program} {now:%a %b %d %H:%M:%S %Y} pid {self.pid}\n", encoding="utf-8")
         d = {"program": self.program, "pid": self.pid, "what": self.what, "who": self.who,
              "since": now.isoformat(timespec="seconds"), "host": socket.gethostname(), "token": self.token,
-             "version": VERSION}
+             "version": VERSION, "need_gb": self.need_gb}
         tmp = lock / "owner.json.tmp"
         tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, lock / "owner.json")
@@ -516,6 +712,10 @@ class HeavyLock:
                 self.now = False
                 self._drop(self._nowfile)
                 self._nowfile = None
+                if self.joined:
+                    self.joined = self.held = False
+                    self._journal("join-end", held=time.time() - self._t_take if self._t_take else None)
+                    return
                 self._journal("now-end")
             if not self.held:
                 return
@@ -560,7 +760,10 @@ class HeavyLock:
     def checkpoint(self, cancel: threading.Event | None = None, on_wait=None, poll: float = 1.0) -> bool:
         """Контрольная точка фона: ждёт человек - отдать, встать в очередь, получить снова.
         True - уступили (после - self.held: получили ли обратно; False - отмена)."""
-        if not self.held or self.outside or self.unavailable or self.who != BACKGROUND or not self.human_waiting():
+        if not self.held or self.outside or self.unavailable or self.who != BACKGROUND:
+            return False
+        cfg = settings(self.path)
+        if not (self._bg_parked() or (cfg["mode"] != "night" and self.human_waiting())):
             return False
         self.release(reason="yield")
         self.acquire(cancel=cancel, on_wait=on_wait, poll=poll)
@@ -603,7 +806,46 @@ def _cli_status(lock: Path, as_json: bool) -> int:
     return 0
 
 
+MODE_TEXT = {"mine_first": "Сначала мои программы", "one_at_a_time": "Только по очереди", "night": "Ночь - всё фону"}
+
+
+def _cli_gpu(lock: Path) -> int:
+    """«Видеокарта»: кто работает и сколько памяти занял, кто ждёт, режим (README, 10.5)."""
+    cfg = settings(lock)
+    used, working = used_gb(lock, cfg)
+    print(f"Режим: {MODE_TEXT[cfg['mode']]}" + (" · фон на паузе" if cfg["pause_background"] else ""))
+    print(f"Память: занято {'?' if used is None else f'{used:g}'} из {cfg['budget_gb']:g} ГБ")
+    if not working:
+        print("Работающих нет.")
+    for h in working:
+        n = need_of(h, cfg)
+        row = cfg["needs_gb"].get(h.program) or {}
+        how = "заявлено" if h.need_gb else ("замер" if row.get("measured") else "не замерено")
+        off = " · отпущен, уступит на контрольной точке" if h.background and held_off(lock, h.pid) else ""
+        print(f"  работает: {_describe(h)} - {'?' if n is None else f'{n:g} ГБ'} ({how}){off}")
+    for i, w in enumerate(queue(lock), 1):
+        off = " · отпущен - ждёт «Вернуть»" if w.background and held_off(lock, w.pid) else ""
+        print(f"  ждёт {i}: {_describe(w)}{off}")
+    return 0
+
+
+def _run_cmd(cmd: list[str], who: str) -> list[str]:
+    """Фон - с пониженным приоритетом процесса (README, 10.4): macOS - taskpolicy -b, иначе nice."""
+    if who != BACKGROUND or os.environ.get("HEAVY_LOCK_NICE") == "0":
+        return cmd
+    if sys.platform == "darwin" and shutil.which("taskpolicy"):
+        return ["taskpolicy", "-b", *cmd]
+    if shutil.which("nice"):
+        return ["nice", "-n", "10", *cmd]
+    return cmd
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    command: list[str] = []
+    if "--" in argv:                    # run: команда - всё после «--», параметры до него разбираются как обычно
+        i = argv.index("--")
+        argv, command = argv[:i], argv[i + 1:]
     ap = argparse.ArgumentParser(prog="heavy_lock.sh", description="Очередь видеокарты .heavy-lock")
     ap.add_argument("--path", help="путь к .heavy-lock (иначе HEAVY_LOCK или «Разработка ПО»)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -615,14 +857,32 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--who", choices=(HUMAN, BACKGROUND), default=BACKGROUND)
         p.add_argument("--pid", type=int, default=None, help="процесс-владелец (по умолчанию - вызвавший)")
         p.add_argument("--wait-min", type=float, default=330)
-        if name == "run":
-            p.add_argument("command", nargs=argparse.REMAINDER)
+        if name in ("take", "run"):
+            p.add_argument("--need-gb", type=float, default=None, help="пиковая память операции, ГБ")
     st = sub.add_parser("status")
     st.add_argument("--json", action="store_true")
+    sub.add_parser("gpu")
+    md = sub.add_parser("mode")
+    md.add_argument("mode", choices=MODES)
+    pb = sub.add_parser("pause-bg")
+    pb.add_argument("state", choices=("on", "off"))
+    for name in ("let-go", "back"):             # «Отпустить» / «Вернуть» фон процесса (README, 12)
+        sub.add_parser(name).add_argument("pid", type=int)
     a = ap.parse_args(argv)
     lock = Path(a.path) if a.path else default_path()
     if a.cmd == "status":
         return _cli_status(lock, a.json)
+    if a.cmd == "gpu":
+        return _cli_gpu(lock)
+    if a.cmd == "mode":
+        save_settings(lock, mode=a.mode)
+        return _cli_gpu(lock)
+    if a.cmd == "pause-bg":
+        save_settings(lock, pause_background=a.state == "on")
+        return _cli_gpu(lock)
+    if a.cmd in ("let-go", "back"):
+        let_go(lock, a.pid, on=a.cmd == "let-go")
+        return _cli_gpu(lock)
 
     def log(msg: str) -> None:
         print(f"{dt.datetime.now():%H:%M:%S} {msg}", flush=True)
@@ -636,14 +896,14 @@ def main(argv: list[str] | None = None) -> int:
             log(f"жду видеокарту: {who}; перед нами: {ahead}")
 
     if a.cmd == "run":
-        cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
+        cmd = command
         if not cmd:
             ap.error("run: нужна команда после --")
-        lk = HeavyLock(a.program, a.what, who=a.who, path=lock, idle_after=None)
+        lk = HeavyLock(a.program, a.what, who=a.who, path=lock, idle_after=None, need_gb=a.need_gb)
         if not lk.acquire(on_wait=waiting, wait=a.wait_min * 60, poll=5):
             log(f"видеокарту не получил за {a.wait_min:g} мин (занята: {_describe(lk.holder()) if lk.holder() else '?'})")
             return 75
-        log("видеокарта взята")
+        log("видеокарта взята" + (" - работаю рядом, память помещается" if lk.joined else ""))
         env = dict(os.environ, HEAVY_LOCK_HELD="1", HEAVY_LOCK=str(lock))
         proc = None
 
@@ -653,14 +913,15 @@ def main(argv: list[str] | None = None) -> int:
         for s in (signal.SIGTERM, signal.SIGINT):
             signal.signal(s, stop)
         try:
-            proc = subprocess.Popen(cmd, env=env)
+            proc = subprocess.Popen(_run_cmd(cmd, a.who), env=env)
             return proc.wait()
         finally:
             lk.release()
             log("видеокарта отдана")
 
     pid = a.pid or os.getppid()
-    lk = HeavyLock(a.program, getattr(a, "what", ""), who=a.who, path=lock, idle_after=None, pid=pid)
+    lk = HeavyLock(a.program, getattr(a, "what", ""), who=a.who, path=lock, idle_after=None, pid=pid,
+                   need_gb=getattr(a, "need_gb", None))
     if a.cmd == "take":
         if not lk.acquire(on_wait=waiting, wait=a.wait_min * 60, poll=5):
             log(f"видеокарту не получил за {a.wait_min:g} мин")
@@ -679,12 +940,14 @@ def main(argv: list[str] | None = None) -> int:
         log("видеокарта отдана")
         return 0
     # yield: контрольная точка фона
-    if not mine or not any(w.who == HUMAN for w in queue(lock)):
+    cfg = settings(lock)
+    parked = a.who == BACKGROUND and (cfg["pause_background"] or held_off(lock, pid))
+    if not mine or not (parked or (cfg["mode"] != "night" and any(w.who == HUMAN for w in queue(lock)))):
         return 0
     what = h.what
     shutil.rmtree(lock, ignore_errors=True)
     journal(lock, "yield", a.program, pid, a.who, what)
-    log("ждёт человек - видеокарта отдана, встаю в очередь")
+    log("фон на паузе - видеокарта отдана, жду кнопки" if parked else "ждёт человек - видеокарта отдана, встаю в очередь")
     lk.what = what
     if not lk.acquire(on_wait=waiting, wait=a.wait_min * 60, poll=5):
         return 75

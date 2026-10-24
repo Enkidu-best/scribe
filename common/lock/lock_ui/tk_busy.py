@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """Окно «Видеокарта занята» для программ на customtkinter (Herald, Scribe, Anonymizer) - README, 6.3.
 
-ask_busy(root, T, holder, lang, cpu=False, queue_names=()) → "wait" / "now" / "cpu" / None.
+ask_busy(root, T, holder, lang, cpu=False, queue_names=()) → "wait" / "now" / "cpu" / None. cpu: True - кнопка
+«На процессоре»; {"seconds": …, "factor": …} - с прогнозом, медленнее видеокарты больше чем в 3 раза - «очень медленно».
 T - модуль темы программы (theme.py: label, button, цвета MUTED / WARN / FAINT): окно выглядит как
 остальная программа. Модальное, по центру окна программы; Esc и крестик - «Отмена», Enter - «Подождать очереди».
 """
 from __future__ import annotations
 
-from .texts import describe, t
+from .texts import cpu_option, describe, t
 
 
 def ask_busy(root, T, holder, lang: str = "ru", cpu: bool = False, queue_names=(), on_open=None) -> str | None:
@@ -36,14 +37,18 @@ def ask_busy(root, T, holder, lang: str = "ru", cpu: bool = False, queue_names=(
     opts = ctk.CTkFrame(wrap, fg_color="transparent")
     opts.pack(fill="x", pady=(16, 0))
     opts.grid_columnconfigure(1, weight=1)
-    rows = [("wait", "primary", "pause", t("wait_hint", lang), T.MUTED),
-            ("now", "default", "play", t("now_hint", lang), T.WARN)]
-    if cpu:
-        rows.append(("cpu", "default", "cpu", t("cpu_hint", lang), T.MUTED))
+    rows = [("wait", "primary", "pause", t("wait", lang), t("wait_hint", lang), T.MUTED),
+            ("now", "default", "play", t("now", lang), t("now_hint", lang), T.WARN)]
+    co = cpu_option(cpu, lang)        # cpu: True или {"seconds", "factor"} - прогноз по замеру программы (доп. 21:40)
+    if co:
+        label, hint, slow = co
+        rows.append(("cpu", "ghost" if slow else "default", "cpu", label, hint, T.WARN if slow else T.MUTED))
     buttons = {}
-    for r, (key, kind, ic, hint, color) in enumerate(rows):
-        b = T.button(opts, t(key, lang), ic if _has_icon(T, ic) else None, kind=kind, width=210, height=38,
+    for r, (key, kind, ic, label, hint, color) in enumerate(rows):
+        b = T.button(opts, label, ic if _has_icon(T, ic) else None, kind=kind, width=250, height=38,
                      command=lambda k=key: close(k))
+        if kind == "ghost":
+            b.configure(border_width=1, border_color=T.BORDER_STRONG)
         b.grid(row=r, column=0, sticky="w", pady=4)
         T.label(opts, hint, 12, color=color, anchor="w", justify="left", wraplength=280
                 ).grid(row=r, column=1, sticky="w", padx=(14, 0))

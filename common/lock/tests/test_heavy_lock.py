@@ -468,6 +468,15 @@ class Shell(Base):
         self.assertIn("DIR=True", r.stdout)
         self.assertFalse(self.lock.exists())
 
+    def test_run_with_options(self):
+        r = self.sh("run", "Понятный документ", "прогон", "--who", "background", "--wait-min", "5", "--",
+                    sys.executable, "-c", "import json, os, sys; sys.path.insert(0, os.environ['LOCKMOD']); "
+                    "from lock import heavy_lock as hl; h = hl.status(os.environ['HEAVY_LOCK']); "
+                    "print('WHO=' + h.who + ' WHAT=' + h.what)",
+                    env={**os.environ, "LOCKMOD": str(HERE.parents[1])})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("WHO=background WHAT=прогон", r.stdout)
+
     def test_yield(self):
         s = self.sleeper()
         self.sh("take", "Herald (ночь)", "глава 3", "--pid", str(s.pid))
@@ -511,6 +520,22 @@ class Texts(unittest.TestCase):
         self.assertIn("ahead of you: 2", tx.waiting_line(h, 2, "en"))
         old = dt.datetime(2026, 10, 22, 9, 5)
         self.assertEqual(hl.since_text(old, now=dt.datetime(2026, 10, 23, 12, 0)), "22.10 09:05")
+
+
+class CpuOption(unittest.TestCase):
+    """«На процессоре» с прогнозом (доп. 21:40): медленнее видеокарты больше чем в 3 раза - «очень медленно»."""
+
+    def test_cpu_option(self):
+        self.assertIsNone(tx.cpu_option(None))
+        self.assertEqual(tx.cpu_option(True)[0], "На процессоре")
+        label, hint, slow = tx.cpu_option({"seconds": 90, "factor": 1.2})
+        self.assertEqual((label, slow), ("На процессоре", False))
+        self.assertIn("≈ 2 мин", hint)
+        label, hint, slow = tx.cpu_option({"seconds": 4 * 3600 + 600, "factor": 12}, "ru")
+        self.assertEqual((label, slow), ("На процессоре (очень медленно)", True))
+        self.assertIn("≈ 4 ч 10 мин (в 12 раз дольше", hint)
+        self.assertIn("12 times longer", tx.cpu_option({"seconds": 600, "factor": 12}, "en")[1])
+        self.assertEqual(tx.eta_text(20), "20 с")
 
 
 class StatusJson(Base):

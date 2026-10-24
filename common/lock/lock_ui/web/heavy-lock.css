@@ -6,19 +6,21 @@
   box-shadow: 0 12px 40px rgba(0, 0, 0, .25); font: inherit; }
 .hl-title { margin: 0 0 6px; font-size: 1.12em; font-weight: 600; line-height: 1.4; }
 .hl-note { margin: 4px 0 0; color: var(--muted, #5f6b7a); font-size: .93em; }
-.hl-options { display: grid; grid-template-columns: max-content 1fr; gap: 8px 14px; align-items: center; margin-top: 16px; }
+.hl-options { display: grid; grid-template-columns: minmax(200px, 250px) 1fr; gap: 8px 14px; align-items: center; margin-top: 16px; }
+.hl-options .hl-btn { width: 100%; box-sizing: border-box; white-space: normal; }
 .hl-hint { color: var(--muted, #5f6b7a); font-size: .88em; line-height: 1.35; }
 .hl-hint.hl-warn { color: var(--warn, #9a6200); }
 .hl-btn { min-width: 200px; padding: 9px 14px; border-radius: 8px; border: 1px solid var(--border-strong, #c9cfd7);
-  background: var(--surface2, #eef1f5); color: var(--text, #1b2230); font: inherit; cursor: pointer; text-align: left; }
+  background: var(--surface-2, #eef1f5); color: var(--text, #1b2230); font: inherit; cursor: pointer; text-align: left; }
 .hl-btn:hover { border-color: var(--accent, #1f3864); }
 .hl-btn:focus-visible { outline: 2px solid var(--accent, #1f3864); outline-offset: 2px; }
 .hl-primary { background: var(--accent, #1f3864); border-color: var(--accent, #1f3864); color: var(--accent-text, #fff); }
 .hl-ghost { min-width: 0; background: transparent; border-color: transparent; color: var(--muted, #5f6b7a); }
+.hl-btn.hl-slow { min-width: 200px; border-color: var(--border-strong, #c9cfd7); color: var(--text, #1b2230); }
 .hl-foot { display: flex; justify-content: flex-end; margin-top: 14px; }
 @media (max-width: 600px) { .hl-options { grid-template-columns: 1fr; } .hl-btn { min-width: 0; width: 100%; } }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .hl-dialog { background: var(--surface, #171b23); color: var(--text, #e5e9f0); border-color: var(--border, #2a313d); }
-  :root:not([data-theme="light"]) .hl-btn { background: var(--surface2, #1f2530); color: var(--text, #e5e9f0); border-color: var(--border-strong, #3a4250); }
+  :root:not([data-theme="light"]) .hl-btn { background: var(--surface-2, #1f2530); color: var(--text, #e5e9f0); border-color: var(--border-strong, #3a4250); }
   :root:not([data-theme="light"]) .hl-primary { background: var(--accent, #8fb0e8); color: var(--accent-text, #0f1218); }
 }
