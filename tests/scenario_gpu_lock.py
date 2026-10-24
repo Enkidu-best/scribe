@@ -19,6 +19,7 @@ site-packages с pyobjc, например из соседнего проекта
   S6  «Запустить сейчас»: работает поверх (now-…), шапка «работает вместе с …», после - пометка убрана
   S7  сквозной: фон держит замок → «Подождать очереди» → фон отдаёт на контрольной точке → Scribe сам → фон снова
   S8  диктофон: окно с четвёртым вариантом «На процессоре»; «Отмена» - запись не началась, замок не взят
+  S9  прерванная расшифровка (06 Б): у файла и на главной кнопке «Продолжить (готово 66 %)»; другой язык - сначала
 """
 import os
 import shutil
@@ -37,7 +38,7 @@ SHOTS = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else None
 TMP = Path(tempfile.mkdtemp(prefix="scribe-gpu-lock-"))
 REAL_HF = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
 os.environ.update(HOME=str(TMP / "home"), HEAVY_LOCK=str(TMP / ".heavy-lock"), HF_HOME=REAL_HF,
-                  HF_HUB_OFFLINE="1")
+                  HF_HUB_OFFLINE="1", SCRIBE_RESUME_DIR=str(TMP / "resume"))
 os.environ.pop("HEAVY_LOCK_HELD", None)
 os.environ.pop("HEAVY_LOCK_WHO", None)
 (TMP / "home").mkdir()
@@ -385,6 +386,34 @@ try:
     release(hd2)
     check("S8 освободилось - запись начинается сама", until(lambda: state.get("begin") and dp.hlock.held, 10))
     dp.hlock.release()
+
+    # S9 - прерванная расшифровка (06 Б): готовые куски на диске - «Продолжить (готово N %)» у файла и на кнопке
+    app.show("files")
+    pump(0.5)
+    app.clear_selection()
+    sem = wav("семинар.wav", 2.0)
+    app._add_paths([str(sem)])
+    pump(0.5)
+    j9 = next(x for x in app.jobs if x.path == sem)
+    st = G.resume_store(sem, app.cfg.get("model_repo", G.MODEL_REPO), G.LANG_CODE.get(j9.opts["lang"]),
+                        app.cfg.get("normalize", True))
+    st.open([(0.0, 30.0), (31.0, 60.0), (61.0, 90.0)])
+    st.add(0, [{"start": 0.0, "end": 5.0, "text": " готово"}])
+    st.add(1, [{"start": 31.0, "end": 35.0, "text": " тоже"}])
+    app._probe([j9])
+    pump(0.5)
+    check("S9 у файла - «Продолжить (готово 66 %)»", "Продолжить (готово 66 %)" in labels(j9.row.acts),
+          str(labels(j9.row.acts)))
+    check("S9 главная кнопка «Продолжить: семинар.wav (готово 66 %)» без обрезки",
+          app.run_btn.cget("text") == "Продолжить: семинар.wav (готово 66 %)" and fits(app.run_btn),
+          app.run_btn.cget("text"))
+    shot("08-resume")
+    other = "English" if j9.opts["lang"] != "English" else "Русский"
+    app.lang_seg.set(other)
+    app._opt_changed("lang")
+    pump(0.3)
+    check("S9 другой язык - готовые куски не те: «Расшифровать: семинар.wav»",
+          app.run_btn.cget("text") == "Расшифровать: семинар.wav" and not j9.resume, app.run_btn.cget("text"))
 finally:
     for p in procs:
         if p.poll() is None:

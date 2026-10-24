@@ -95,7 +95,8 @@ from core import (  # noqa: F401 - всё ядро доступно и как wh
     group_by_speaker, _tmp_for, write_txt, write_srt, write_docx, SR_FAST,
     _decode_to_array, _transcribe_array, transcribe_auto, transcribe_multilang_fast, _PIPELINES, _load_pipeline,
     _mk_hook, _extract_turns, diarize_and_label, free_asr_models, read_transcript, ollama_installed,
-    _fmt_dur, _fmt_size, _short, explain_error, log_error, is_memory_error)
+    _fmt_dur, _fmt_size, _short, _pct, explain_error, log_error, is_memory_error, resume_store, resume_share,
+    prune_resume)
 
 # ---------------------------------------------------------------------------
 # Интерфейс
@@ -126,6 +127,7 @@ class Job:
         self.kind = "text" if path.suffix.lower() in TEXT_EXTS else "audio"
         self.segments = None       # сегменты держим до закрытия окна - для «Подвести итоги»
         self.diarized = False
+        self.resume = None         # прерванная расшифровка: доля готовых кусков (06 Б) - «Продолжить (готово 64 %)»
         if self.kind == "text":     # готовая расшифровка: сразу «готово», можно подвести итоги
             self.state, self.out = "done", path
             sp = summary.summary_path(path)
@@ -199,6 +201,10 @@ class FileRow(ctk.CTkFrame):
             T.button(self.acts, "", "folder-open", kind="ghost", height=28,
                      command=lambda: pu.reveal(j.out)
                      ).pack(side="left", padx=2)
+        elif j.kind == "audio" and j.resume and j.state in ("queue", "error", "cancel"):
+            self.acts.grid(row=3, column=1, columnspan=3, sticky="w", pady=(0, 10))
+            T.button(self.acts, f"Продолжить (готово {_pct(j.resume)})", "play", height=28, size=13, width=210,
+                     command=lambda: self.app._enqueue([j])).pack(side="left", padx=(0, 4))
         else:
             self.acts.grid_remove()
         if j.state == "error":
@@ -406,6 +412,7 @@ class App:
         self.root.after(500, self._tick)
         self.root.after(600, self._prebuild_dict)
         threading.Thread(target=self._probe_engine, daemon=True).start()
+        threading.Thread(target=prune_resume, daemon=True).start()    # забытые прерванные расшифровки (06 Б)
         self._check_ollama()
 
     # ================= боковое меню =================
@@ -917,6 +924,8 @@ class App:
             if not self._editable(j) or j.opts.get(key) == val:
                 continue
             j.opts[key] = val
+            if key == "lang":                                      # другой язык - готовые куски не те
+                j.resume = self._resume_of(j)
             if j.state in ("done", "error", "cancel"):             # готовый файл - снова в очередь
                 j.state, j.error, j.warn, j.info, j.stage = "queue", "", "", "", ""
                 j.out, j.summary, j.segments, j.diarized = None, None, None, False
@@ -981,7 +990,14 @@ class App:
 
     def _probe(self, jobs):
         for j in jobs:
-            self.q.put(("job", j, {"duration": ffprobe_duration(j.path)}))
+            self.q.put(("job", j, {"duration": ffprobe_duration(j.path), "resume": self._resume_of(j)}))
+
+    def _resume_of(self, job):
+        """Сколько готово у прерванной расшифровки файла с его нынешними настройками (06 Б) или None."""
+        if job.kind != "audio" or job.opts.get("lang") == "Несколько":
+            return None
+        return resume_share(job.path, self.cfg.get("model_repo", MODEL_REPO), LANG_CODE.get(job.opts.get("lang")),
+                            self.cfg.get("normalize", True))
 
     def add_files(self):
         if self.running:
@@ -1050,12 +1066,15 @@ class App:
     def _eta(self, v):
         """« · осталось ~4 мин» - по скорости текущего этапа (стандарт 2.2)."""
         t0 = getattr(self, "_stage_t0", None)
-        if not t0 or v < 0.05 or v >= 0.995:
+        if not t0 or v <= 0 or v >= 0.995:
             return ""
-        el = time.monotonic() - t0
-        if el < 5:
+        if getattr(self, "_stage_v0", None) is None:      # первая отметка этапа: продолжение (06 Б) - не с нуля
+            self._stage_v0, self._stage_t0 = v, time.monotonic()
             return ""
-        rem = el * (1 - v) / v
+        el, done = time.monotonic() - self._stage_t0, v - self._stage_v0
+        if el < 5 or done < 0.03:
+            return ""
+        rem = el * (1 - v) / done
         return f"  ·  осталось ~{max(1, round(rem / 60))} мин" if rem >= 60 else f"  ·  осталось ~{max(5, round(rem / 5) * 5)} с"
 
     def _set_status(self, text, color=T.MUTED):
@@ -1093,7 +1112,7 @@ class App:
                 elif kind == "stage":
                     _, job, chip, text = msg
                     if text.split(":")[0] != getattr(self, "_stage_base", None):   # новый этап - часы этапа
-                        self._stage_base, self._stage_t0 = text.split(":")[0], time.monotonic()
+                        self._stage_base, self._stage_t0, self._stage_v0 = text.split(":")[0], time.monotonic(), None
                     job.stage = chip
                     self.cur_job = job
                     self.stage_text = text
@@ -1125,7 +1144,7 @@ class App:
                         job.row.refresh()
                     if job in self.sel:
                         self._panel_load()
-                    if "state" in upd:
+                    if "state" in upd or "resume" in upd:
                         self._refresh_run_buttons()
                 elif kind == "gpuwait":                  # встали в очередь видеокарты / дождались
                     self.gpu_waiting = msg[1]
@@ -1190,7 +1209,9 @@ class App:
                                        width=230 if self.gpu_waiting else 170)   # «Отменить ожидание» не обрезана
             T.restyle(self.all_btn, "danger", "square")
             return
-        if t:
+        if len(t) == 1 and t[0].resume:
+            self.run_btn.configure(state="normal", text=f"Продолжить{what} (готово {_pct(t[0].resume)})")
+        elif t:
             self.run_btn.configure(state="normal",
                                    text=("Расшифровать" + what) if len(t) == 1 else f"Расшифровать выбранные ({len(t)})")
         else:
@@ -1505,7 +1526,7 @@ class App:
                     done.append(self._run_one(job, jo, eng_j, stage, cancel))
             except Cancelled:
                 cancelled = True
-                self._job(job, state="cancel")
+                self._job(job, state="cancel", resume=self._resume_of(job))
             except FileNotFoundError as e:
                 if "ffmpeg" in str(e) or "ffprobe" in str(e):
                     self._job(job, state="error", error="Не найден ffmpeg")
@@ -1518,7 +1539,8 @@ class App:
             except Exception as e:
                 failed += 1
                 log_error(e, f"расшифровка {job.path.name}")
-                self._job(job, state="error", error=explain_error(e))
+                share = self._resume_of(job)               # готовые куски на диске - продолжим с места остановки
+                self._job(job, state="error", error=explain_error(e, resume=bool(share)), resume=share)
                 if is_memory_error(e) and not job.cpu:
                     self.q.put(("oom", job))        # окно: подождать или на процессоре
             finally:
@@ -1568,6 +1590,7 @@ class App:
             raise Cancelled()
         duration = len(audio) / SR_FAST
         self._job(job, duration=duration)
+        store = None
         if o["multilang"]:
             segments = transcribe_multilang_fast(audio, o["model"], eng, self._prog, lambda m: None, cancel,
                                                  stage=stage)
@@ -1581,8 +1604,9 @@ class App:
                 stage.keys.insert(stage.keys.index("asr"), "lang")    # «Авто» стал «Несколько»: +1 шаг
                 self._job(job, info="Найдены русский и английский - обработано как смешанная запись.")
 
+            store = resume_store(path, o["model"], o["lang"], o["normalize"])
             segments, info = transcribe_auto(audio, o["model"], eng, self._prog, cancel, stage=stage,
-                                             forced=o["lang"], on_mixed=on_mixed)
+                                             forced=o["lang"], on_mixed=on_mixed, store=store)
         del audio
 
         diar_used = False
@@ -1607,7 +1631,9 @@ class App:
             write_docx(segments, out, path.stem, o["with_ts"], diar_used)
         else:
             write_srt(segments, out, diar_used)
-        self._job(job, out=out)
+        self._job(job, out=out, resume=None)
+        if store is not None:
+            store.clear()                           # результат сохранён - готовые куски больше не нужны
 
         summ = None
         if o["summary"]:

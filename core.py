@@ -284,7 +284,8 @@ def is_memory_error(e):
 def explain_error(e, resume=False):
     """Текст ошибки для окна: что случилось и что сделать. Английский - только в журнал."""
     t = str(e)
-    again = "Нажмите «Расшифровать» ещё раз" + (" - продолжу с места остановки." if resume else ".")
+    again = ("Нажмите «Продолжить» - распознавание пойдёт с места остановки." if resume
+             else "Нажмите «Расшифровать» ещё раз.")
     if "no Stream" in t or "Stream(gpu" in t:
         return "Сбой движка распознавания. " + again
     if is_memory_error(e):
@@ -360,7 +361,48 @@ def _transcribe_array(eng, audio, model_repo, lang, prog, cancel, initial_prompt
     return eng.transcribe(audio, model_repo, lang, initial_prompt, temperature, prog, cancel)
 
 
-def transcribe_auto(audio, model_repo, eng, prog, cancel, stage=None, forced=None, on_mixed=None):
+RESUME_DIR = Path(os.environ.get("SCRIBE_RESUME_DIR") or pu.data_dir() / "Продолжение расшифровки")
+RESUME_DAYS = 30          # прерванную и забытую расшифровку - убрать через 30 дней
+
+
+def resume_store(path, model_repo, lang, normalize):
+    """Готовые куски файла на диске (06 Б): после сбоя или «Остановить» - продолжение с места остановки."""
+    from common.stt import longfile as lf
+    try:
+        return lf.Store(RESUME_DIR, lf.file_key(path, model=model_repo, lang=lang or "auto", normalize=bool(normalize)))
+    except OSError:
+        return None
+
+
+def resume_share(path, model_repo, lang, normalize):
+    """Сколько готово у прерванной расшифровки файла (0..1) или None."""
+    from common.stt import longfile as lf
+    st = resume_store(path, model_repo, lang, normalize)
+    return lf.saved_share(RESUME_DIR, st.key) if st else None
+
+
+def prune_resume(days=RESUME_DAYS):
+    from common.stt import longfile as lf
+    lf.prune(RESUME_DIR, days)
+
+
+def transcribe_file(eng, audio, model_repo, lang, prog, cancel, store=None, stage=None):
+    """Файл одного языка (06 Б, по практике WhisperX): фразы VAD → куски до 30 с по паузам → пачки; готовые куски -
+    в store. Язык не задан - по первым фразам (как Whisper решал по первым 30 с)."""
+    import vad
+    if stage:
+        stage("asr", "поиск пауз")                  # VAD: на 3 ч записи - около 15 с
+    spans = vad.split_phrases(audio)
+    if not spans:
+        return []
+    if not lang:
+        a, b = spans[0][0], min(spans[-1][1], spans[0][0] + 30.0)
+        lang = (eng.detect_language([audio[int(a * SR_FAST):int(b * SR_FAST)]], model_repo) or [(None, 0)])[0][0]
+    part = (lambda k, n: stage("asr", f"часть {min(n, k + 1)} из {n}")) if stage else None
+    return eng.transcribe_long(audio, spans, model_repo, lang, store, prog, cancel, on_chunk=part)
+
+
+def transcribe_auto(audio, model_repo, eng, prog, cancel, stage=None, forced=None, on_mixed=None, store=None):
     """«Авто» (2.3): сначала дешёвая проверка языков по всем фразам (multilang.probe_languages:
     сито whisper-base + перепроверка turbo).
     В записи есть и русский, и английский - обрабатываем как «Несколько»; иначе - один язык,
@@ -374,7 +416,7 @@ def transcribe_auto(audio, model_repo, eng, prog, cancel, stage=None, forced=Non
         info = dict(mode="single", lang=forced)
         stage("asr")
         prog(0)
-        return _transcribe_array(eng, audio, model_repo, forced, prog, cancel), info
+        return transcribe_file(eng, audio, model_repo, forced, prog, cancel, store, stage), info
     stage("prep", "проверка языков")
     probe = multilang.probe_languages(audio, model_repo, cancel, prog)
     info = dict(probe=probe)
@@ -391,7 +433,7 @@ def transcribe_auto(audio, model_repo, eng, prog, cancel, stage=None, forced=Non
     info.update(mode="single", lang=lang)
     stage("asr")
     prog(0)
-    return _transcribe_array(eng, audio, model_repo, lang, prog, cancel), info
+    return transcribe_file(eng, audio, model_repo, lang, prog, cancel, store, stage), info
 
 
 def transcribe_multilang_fast(audio, model_repo, eng, prog, stat, cancel, stage=None, stats=None):
@@ -603,3 +645,8 @@ def _fmt_size(n):
 
 def _short(name, n=58):
     return name if len(name) <= n else name[:n - 12] + "…" + name[-11:]
+
+
+def _pct(share):
+    """Доля готового для кнопки «Продолжить (готово 64 %)»: не 0 % и не 100 %, пока не всё."""
+    return f"{min(99, max(1, int(share * 100)))} %"

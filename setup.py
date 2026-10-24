@@ -26,7 +26,7 @@ OPTIONS = {
     "iconfile": "scribe.icns",
     "includes": ["dictaphone", "dictaphone_worker", "theme", "summary", "multilang", "vad",
                  "engine", "core", "models", "platform_util"],
-    "packages": ["common"],           # общие модули (очередь видеокарты) - с texts.json и VERSION
+    "packages": ["common"],           # общие модули (очередь видеокарты, длинные файлы) - с texts.json и VERSION
     "plist": {
         "CFBundleName": "Scribe",
         "CFBundleDisplayName": "Scribe",

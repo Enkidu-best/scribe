@@ -10,7 +10,8 @@ Scribe 2.7: одна нить для MLX - нет «There is no Stream(gpu, N) i
 запуск):
   1. три запуска подряд;
   2. запуск после искусственного сбоя посреди распознавания;
-  3. детектор языка фраз («Авто», «Несколько») из разных нитей.
+  3. детектор языка фраз («Авто», «Несколько») из разных нитей;
+  4. файл кусками по паузам пачками (06 Б): два запуска и запуск после сбоя посреди пачек.
 """
 import sys
 import threading
@@ -114,6 +115,30 @@ def main():
             check(pr["mixed"] and len(blocks) > 2, f"языки фраз, проход {k + 1}: смешанная={pr['mixed']}, блоков {len(blocks)}")
         except Exception as e:
             check(False, f"языки фраз, проход {k + 1}: {type(e).__name__}: {e}")
+
+    # 4. файл кусками по паузам пачками (06 Б) из разных нитей, сбой посреди пачек - и снова
+    import vad
+    spans = vad.split_phrases(lesson)
+    for k in range(2):
+        try:
+            segs = in_thread(lambda: eng.transcribe_long(lesson, spans, MODEL, "ru"))
+            check(len(segs) > 3, f"файл пачками, запуск {k + 1}: {len(segs)} фраз")
+        except Exception as e:
+            check(False, f"файл пачками, запуск {k + 1}: {type(e).__name__}: {e}")
+
+    def boom2(f):
+        if f > 0.3:
+            raise RuntimeError("искусственный сбой посреди пачек")
+    try:
+        in_thread(lambda: eng.transcribe_long(lesson, spans, MODEL, "ru", prog=boom2))
+        check(False, "искусственный сбой посреди пачек не случился")
+    except RuntimeError as e:
+        check("пачек" in str(e), "сбой посреди пачек дошёл до вызывающей нити")
+    try:
+        segs = in_thread(lambda: eng.transcribe_long(lesson, spans, MODEL, "ru"))
+        check(len(segs) > 3, "файл пачками после сбоя - без ошибки")
+    except Exception as e:
+        check(False, f"файл пачками после сбоя: {type(e).__name__}: {e}")
 
     # выгрузка из другой нити и снова распознавание
     in_thread(eng.unload)

@@ -30,7 +30,7 @@ datas += [(os.path.join(ROOT, "common", "lock", "lock_ui", "texts.json"), os.pat
           (os.path.join(ROOT, "common", "lock", "VERSION"), os.path.join("common", "lock"))]
 hidden += ["dictaphone", "dictaphone_worker", "engine", "multilang", "vad", "summary", "theme", "models",
            "core", "platform_util", "scribe_cli", "common.lock.heavy_lock", "common.lock.lock_ui.texts",
-           "common.lock.lock_ui.tk_busy"]
+           "common.lock.lock_ui.tk_busy", "common.stt", "common.stt.longfile"]   # stt - длинные файлы (2.7, Б)
 excludes = ["mlx", "mlx_whisper", "torchcodec", "IPython", "jupyter", "notebook", "pytest"]
 
 common = dict(pathex=[ROOT], binaries=binaries, datas=datas, hiddenimports=hidden, excludes=excludes,

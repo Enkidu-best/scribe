@@ -14,6 +14,8 @@
 
 Интерфейс (Engine):
   transcribe(audio, model, lang, prompt, temperature, prog, cancel) -> [сегменты]
+  transcribe_long(audio, spans, model, lang, store, prog, cancel) -> [сегменты]
+                                    (файл: куски по паузам пачками, продолжение после сбоя - common/stt)
   transcribe_text(audio, model, lang, prompt) -> текст          (для диктофона)
   lid(model, own) -> детектор языка фраз (p_en, top_lang, lang_probs, dual)
   warmup(model), unload(), is_local(model), repo(model)
@@ -38,6 +40,8 @@ from summary import Cancelled
 SR = 16000
 LANGS = ("ru", "en")
 LID_MIN_SEC = 10.0     # до скольких секунд дополнять вход детектора (MLX; 5 с - уже ошибается)
+LONG_BATCH = 8         # файл (06 Б): кусков до 30 с в пачке MLX (4-16 - та же скорость, 8 - меньше памяти; Приёмка 2.7)
+FW_LONG_BATCH = 8      # то же для faster-whisper (процессор, NVIDIA)
 
 # Модели: ключ -> (MLX, CTranslate2, размер для faster-whisper, МБ). Все - лицензия MIT.
 MODELS = {
@@ -357,6 +361,21 @@ class MLXEngine:
                 temperature=temperature, condition_on_previous_text=False, verbose=True)
         return res.get("segments", [])
 
+    def transcribe_long(self, audio, spans, model, lang=None, store=None, prog=None, cancel=None, batch=None,
+                        on_chunk=None):
+        return self._call(self._transcribe_long, audio, spans, model, lang, store, prog, cancel, batch or LONG_BATCH,
+                          on_chunk)
+
+    def _transcribe_long(self, audio, spans, model, lang, store, prog, cancel, batch, on_chunk=None):
+        """Файл - кусками по паузам, пачками (06 Б, common/stt): в нити MLX, как всё MLX."""
+        from common.stt import longfile as lf
+        try:
+            return lf.transcribe(audio, spans, lf.mlx_decoder(self.repo(model), lang),
+                                 fallback=lambda c: self._transcribe(c, model, lang, temperature=lf.FALLBACK_T),
+                                 batch=batch, store=store, prog=prog, cancel=cancel, on_chunk=on_chunk)
+        except lf.Cancelled:
+            raise Cancelled() from None
+
     def transcribe_text(self, audio, model, lang=None, prompt=None):
         return self._call(self._transcribe_text, audio, model, lang, prompt)
 
@@ -580,6 +599,21 @@ class FWEngine:
                     prog(min(1.0, s.end / dur))
             return out
         return self._run(go)
+
+    def transcribe_long(self, audio, spans, model, lang=None, store=None, prog=None, cancel=None, batch=None,
+                        on_chunk=None):
+        """Файл - кусками по паузам, пачкой `BatchedInferencePipeline` (06 Б, common/stt)."""
+        from common.stt import longfile as lf
+
+        def go():
+            return lf.transcribe(audio, spans, lf.fw_decoder(self._model(model), lang),
+                                 fallback=lambda c: self.transcribe(c, model, lang, temperature=lf.FALLBACK_T),
+                                 batch=batch or FW_LONG_BATCH, store=store, prog=prog, cancel=cancel,
+                                 on_chunk=on_chunk)
+        try:
+            return self._run(go)
+        except lf.Cancelled:
+            raise Cancelled() from None
 
     def transcribe_text(self, audio, model, lang=None, prompt=None):
         segs = self.transcribe(audio, model, lang, prompt)
