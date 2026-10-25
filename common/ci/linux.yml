@@ -1,4 +1,4 @@
-# Облачная проверка приватного репозитория - шаблон общего блока «_общие модули/ci» (правило «GitHub 01», стандарт 6.8).
+# Облачная проверка (приватный или публичный репозиторий без своего ci.yml) - шаблон общего блока «_общие модули/ci» (правило «GitHub 01», стандарт 6.8).
 # Только Linux, одна задача: ruff, юнит-тесты без моделей, check_repo - та же команда, что перед push на Mac
 # (scripts/check_all.sh). macOS не нужен - полные проверки идут локально; Windows - только вручную (windows.yml).
 # Не править в проекте: правка - в шаблоне, затем sync_common.sh ci <проект> и common/ci/install.sh --workflow.
@@ -6,7 +6,7 @@ name: linux
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]        # master - Anonymizer
     tags: ["v*"]
     paths-ignore: ["docs/**", "*.md", "*.docx"]
   workflow_dispatch:
