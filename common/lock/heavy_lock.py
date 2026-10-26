@@ -558,6 +558,8 @@ class HeavyLock:
                 return True
             if self._bg_parked():
                 return False                    # «Фон на паузе» / «Отпустить» - ждать кнопки, а не очереди
+            if self._own_background(lock):
+                return self._join_own()         # замок у фона своей же программы - человек не ждёт (README, 5.9)
             if self.ahead() > 0:
                 return False
             for _ in range(3):              # повтор - после снятия брошенного замка
@@ -642,6 +644,24 @@ class HeavyLock:
         self._qfile = None
         used, _ = used_gb(self.path, cfg)
         self._journal("join", note=f"{(self.holder() or Holder('-')).program}; занято {used} из {cfg['budget_gb']} ГБ")
+        return True
+
+    def _own_background(self, lock: Path) -> bool:
+        """Замок держит фон этой же программы («векторы правил» после смены игры), а просит человек: модели те же и уже
+        в памяти Ollama - ждать свою же пересборку незачем (задание 06 Настольного помощника, И)."""
+        if self.who != HUMAN or self.now:
+            return False
+        h = _read_holder(lock) if lock.is_dir() else None
+        return bool(h is not None and h.background and not _stale(lock, h) and h.program == self.program)
+
+    def _join_own(self) -> bool:
+        self.now = self.joined = self.held = True
+        self._nowfile = self._entry("now")
+        self.last_active = self.clock()
+        self._t_take = time.time()
+        self._drop(self._qfile)
+        self._qfile = None
+        self._journal("join", note="фон своей программы - человек не ждёт")
         return True
 
     def _write_owner(self, lock: Path) -> None:

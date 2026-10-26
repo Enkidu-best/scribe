@@ -522,6 +522,40 @@ class Shell(Base):
         self.assertEqual((h.program, h.pid, h.what), ("Herald (ночь)", s.pid, "глава 3"))
 
 
+class OwnBackground(Base):
+    """L10 (1.4.0, задание 06 Настольного помощника, И): человек не ждёт фон своей же программы."""
+
+    def test_human_joins_own_program_background(self):
+        bg = self.mk("Настольный помощник", who=hl.BACKGROUND, what="векторы правил и готовые вопросы")
+        self.assertTrue(bg.try_acquire())
+        human = self.mk("Настольный помощник", what="ответ на вопрос по правилам")
+        t0 = time.monotonic()
+        self.assertTrue(human.acquire(wait=5, poll=0.1))
+        self.assertLess(time.monotonic() - t0, 1.0)                 # сразу, не после пересборки
+        self.assertTrue(human.joined and human.now)
+        self.assertEqual(hl.status(self.lock).what, "векторы правил и готовые вопросы")   # замок по-прежнему у фона
+        human.release()
+        self.assertTrue(bg.held and self.lock.is_dir())               # фон работает дальше
+        bg.release()
+        self.assertFalse(self.lock.exists())
+
+    def test_other_program_still_waits_for_background(self):
+        bg = self.mk("Настольный помощник", who=hl.BACKGROUND)
+        self.assertTrue(bg.try_acquire())
+        other = self.mk("Interview Coach")
+        self.assertFalse(other.try_acquire())                        # чужой фон - очередь и уступка на контрольной точке
+        own_bg = self.mk("Настольный помощник", who=hl.BACKGROUND, what="ещё фон")
+        self.assertFalse(own_bg.try_acquire())                       # фон своего фона не обходит
+        bg.release()
+
+    def test_own_human_holder_is_not_joined(self):
+        h1 = self.mk("Настольный помощник")
+        self.assertTrue(h1.try_acquire())
+        h2 = self.mk("Настольный помощник", what="второй вопрос")
+        self.assertFalse(h2.try_acquire())                           # человек человека - по очереди, как раньше
+        h1.release()
+
+
 class Texts(unittest.TestCase):
     """L9: тексты RU = EN по ключам, алфавит."""
 
